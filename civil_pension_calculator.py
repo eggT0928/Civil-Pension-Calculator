@@ -46,7 +46,6 @@ def pct(value: float) -> str:
     return f"{value:.3f}%"
 
 def get_pension_start_age(entry_date: date, retirement_year: int) -> int:
-    """공무원연금 개시연령 규정"""
     if entry_date <= date(1995, 12, 31): return 60
     if entry_date <= date(2009, 12, 31):
         if retirement_year <= 2021: return 60
@@ -80,7 +79,6 @@ def weighted_average_rate(start_year_float: float, end_year_float: float) -> flo
     return total_rate / total_weight if total_weight > 0 else 0.0
 
 def recognized_service_cap(pre_2016_service_years: float) -> int:
-    """2016.1.1 기준 재직기간 상한"""
     if pre_2016_service_years >= 21: return 33
     if pre_2016_service_years >= 17: return 34
     if pre_2016_service_years >= 15: return 35
@@ -137,10 +135,10 @@ def calculate_pension(
     recognized_service_years = y1 + y2 + y3
 
     # ==========================================
-    # 💡 [논리 수정] 모든 기준을 "현재 물가(Present Value)"로 통일
+    # 기준소득월액 설정 (현재 물가 기준)
     # ==========================================
     current_standard_income = current_contribution / CONTRIBUTION_RATE if current_contribution > 0 else 0.0
-    current_a_value = OFFICIAL_A_VALUES[max(OFFICIAL_A_VALUES.keys())] # 현재 고시된 최신 A값
+    current_a_value = OFFICIAL_A_VALUES[max(OFFICIAL_A_VALUES.keys())] 
     
     est_final_3_years = current_standard_income
     est_b_value = current_standard_income * 0.90
@@ -156,6 +154,9 @@ def calculate_pension(
     if y3 > 0:
         base_p3_income = exact_redist_value if (use_exact_data and exact_redist_value > 0) else est_redist_value
 
+    # ==========================================
+    # 1. 퇴직연금액 계산 (현재 가치)
+    # ==========================================
     period1_monthly, period2_monthly, period3_monthly = 0.0, 0.0, 0.0
     
     if y1 > 0:
@@ -170,14 +171,38 @@ def calculate_pension(
         avg_rate_2016plus = weighted_average_rate(start_year_for_rate, start_year_for_rate + y3)
         period3_monthly = base_p3_income * y3 * (avg_rate_2016plus / 100)
 
-    # ==========================================
-    # 💡 [논리 수정] 연금액 가치 산출 정상화
-    # ==========================================
-    # 1. 위에서 계산된 합계는 '현재 물가 기준'의 연금액(Present Value)
     present_value_monthly_pension = period1_monthly + period2_monthly + period3_monthly
-
-    # 2. 퇴직 시점의 액면가(미래 명목 가치)는 현재가치에 보수상승률을 복리로 적용하여 산출
     estimated_monthly_pension = present_value_monthly_pension * ((1 + salary_growth) ** years_to_retire)
+
+    # ==========================================
+    # 2. 퇴직수당 및 일시금 계산 (현재/미래 가치)
+    # ==========================================
+    total_years = recognized_service_years
+    
+    # 퇴직수당 지급 비율
+    if total_years < 1: allowance_rate = 0.0
+    elif total_years < 5: allowance_rate = 0.065
+    elif total_years < 10: allowance_rate = 0.2275
+    elif total_years < 15: allowance_rate = 0.2925
+    elif total_years < 20: allowance_rate = 0.325
+    else: allowance_rate = 0.39
+
+    final_income_pv = current_standard_income
+    allowance_pv = final_income_pv * total_years * allowance_rate
+    
+    # 퇴직연금일시금 산출
+    lump_sum_1_pv = 0.0
+    if y1 > 0:
+        excess_5 = max(0.0, y1 - 5.0)
+        lump_sum_1_pv = base_p1_income * y1 * (0.975 + excess_5 * 0.0065)
+        
+    # 2, 3기간 일시금: B값 * 재직연수 * 1.17 (월 기준 9.75%)
+    lump_sum_23_pv = base_p2_income * (y2 + y3) * 1.17
+    lump_sum_total_pv = lump_sum_1_pv + lump_sum_23_pv
+    
+    # 명목 가치(미래)로 환산
+    allowance_fv = allowance_pv * ((1 + salary_growth) ** years_to_retire)
+    lump_sum_total_fv = lump_sum_total_pv * ((1 + salary_growth) ** years_to_retire)
 
     pension_start_age = get_pension_start_age(entry_date, retirement_year)
     gap_years = max(0, pension_start_age - retirement_age)
@@ -192,6 +217,8 @@ def calculate_pension(
         "period1_monthly": period1_monthly, "period2_monthly": period2_monthly, "period3_monthly": period3_monthly,
         "estimated_monthly_pension": estimated_monthly_pension,
         "present_value_monthly_pension": present_value_monthly_pension,
+        "allowance_pv": allowance_pv, "allowance_fv": allowance_fv,
+        "lump_sum_total_pv": lump_sum_total_pv, "lump_sum_total_fv": lump_sum_total_fv,
         "pension_start_age": pension_start_age, "gap_years": gap_years, "retirement_year": retirement_year
     }
 
@@ -229,7 +256,7 @@ with st.sidebar:
 
     st.divider()
     with st.expander("경제 지표 가정 (옵션)"):
-        salary_growth_pct = st.number_input("미래 연 보수상승률 (%)", value=2.50, step=0.1, help="퇴직 시점의 명목 연금액(미래 가치)을 계산하는 데 사용됩니다.")
+        salary_growth_pct = st.number_input("미래 연 보수상승률 (%)", value=2.50, step=0.1, help="퇴직 시점의 명목 가치를 계산하는 데 사용됩니다.")
         inflation_pct = st.number_input("미래 연 물가상승률 (%)", value=2.00, step=0.1)
 
 # 계산 실행
@@ -241,13 +268,27 @@ res = calculate_pension(
     use_exact_data=use_exact_data, exact_b_value=exact_b_value, exact_redist_value=exact_redist_value, exact_p1_value=exact_p1_value
 )
 
-# 핵심 결과 출력
+# 핵심 결과 출력 (연금)
 st.subheader("💰 퇴직 시 예상 월 연금액")
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("퇴직 시점 명목 월연금", won(res["estimated_monthly_pension"]), help="미래 퇴직 시점에 실제로 통장에 찍힐 예상 명목 금액입니다. (보수상승률 복리 적용)")
-c2.metric("현재가치 환산 월연금", won(res["present_value_monthly_pension"]), help="퇴직 시 받을 연금액을 현재 물가 수준(체감 가치)으로 환산한 금액입니다.")
+c1.metric("월 연금 (현재가치)", won(res["present_value_monthly_pension"]), help="퇴직 시 받을 연금액을 현재 물가 수준(체감 가치)으로 환산한 금액입니다.")
+c2.metric("월 연금 (명목가치)", won(res["estimated_monthly_pension"]), help="미래 퇴직 시점에 실제로 통장에 찍힐 예상 명목 금액입니다. (보수상승률 복리 적용)")
 c3.metric("총 인정 재직기간", f"{res['recognized_service_years']:.1f}년 (최대 {res['service_cap_years']}년)")
 c4.metric("연금 개시 연령", f"{res['pension_start_age']}세 ({res['gap_years']}년 소득공백)")
+
+st.divider()
+
+# 핵심 결과 출력 (일시금)
+st.subheader("💼 퇴직 시 예상 일시금액 (수당 및 연금일시금)")
+st.markdown("공무원은 퇴직 시 **'연금 + 퇴직수당'**을 받거나, 연금을 포기하고 **'연금일시금 + 퇴직수당'**을 목돈으로 한 번에 수령할 수 있습니다.")
+
+d1, d2, d3, d4 = st.columns(4)
+d1.metric("퇴직수당 (현재가치)", won(res["allowance_pv"]), help="연금을 선택하든 일시금을 선택하든 무조건 지급받는 수당입니다.")
+d2.metric("퇴직수당 (명목가치)", won(res["allowance_fv"]))
+d3.metric("연금일시금 (현재가치)", won(res["lump_sum_total_pv"]), help="매월 나오는 연금 대신, 일시불로 전액 수령할 경우의 금액입니다.")
+d4.metric("연금일시금 (명목가치)", won(res["lump_sum_total_fv"]))
+
+st.info(f"💡 **일시금으로 전액 수령 시 총액 [현재가치]:** {won(res['allowance_pv'] + res['lump_sum_total_pv'])} / **[명목가치]:** {won(res['allowance_fv'] + res['lump_sum_total_fv'])}")
 
 st.divider()
 

@@ -66,7 +66,7 @@ DEFAULTS = {
     "inflation": 2.09,
     "teaching_allowance": 250000,
     "meal_allowance": 160000,
-    "homeroom_allowance": 250000,
+    "homeroom_allowance": 200000,
     "position_allowance": 150000,
     "research_fee": 60000,
     "geunsok_gabong": 81000,
@@ -380,7 +380,7 @@ def calculate_pension(
     gap_years = max(0, pension_start_age - retirement_age)
 
     present_value_monthly_pension = estimated_monthly_pension / ((1 + inflation / 100) ** max(0, pension_start_year - CURRENT_YEAR))
-    current_monthly_contribution = current_income * 0.09
+    current_monthly_contribution = current_income * 0.09  # 추정치: 실제 기준소득월액과 차이 날 수 있음
     future_contribution_sum = geometric_contribution_estimate(current_income, salary_growth, years_to_retire)
 
     recognized_service_years = max(0.0, pension_timeline_end - pension_timeline_start)
@@ -517,9 +517,8 @@ pension = calculate_pension(
 # =====================================
 st.info(
     "이 계산기는 공식 산정액이 아닌 추정용 베타입니다. "
-    "다만 2026 교원 봉급표, 2026 교육공무원 성과상여금 공지액, "
-    "기여금 9%, 1·2·3기간 분할, 1996년 이후 지급개시연령 단계 상향 구조를 반영해 "
-    "실제 의사결정에 도움이 되도록 설계했습니다."
+    "현재 버전은 구조 이해용이며, 실제 공무원연금공단의 기준소득월액 이력과 소득재분배 평균기준소득월액을 완전하게 재현하지 못합니다. "
+    "특히 현재 기여금과 예상 연금은 실제 공단 수치와 다를 수 있으므로 참고용으로만 활용해 주세요."
 )
 
 m1, m2, m3, m4 = st.columns(4)
@@ -612,26 +611,12 @@ with right:
         """
     )
 
-st.subheader("5) 배포용 안내")
-st.code(
-    """# requirements.txt
-streamlit>=1.44
-pandas>=2.2
-""",
-    language="text",
-)
-
+st.subheader("5) 주의")
 st.markdown(
     """
-### GitHub + Streamlit Community Cloud 배포 순서
-1. 이 파일명을 **app.py** 로 저장합니다.
-2. 같은 저장소에 **requirements.txt** 를 함께 올립니다.
-3. GitHub 저장소를 Streamlit Community Cloud에 연결합니다.
-4. Main file path를 **app.py** 로 지정해 배포합니다.
-
-### 주의
-- 이 계산기는 **공식 산정액이 아닌 추정용 베타**입니다.
-- 실제 지급액은 공무원연금공단 산정, 기준소득월액 이력, 소득재분배 평균기준소득월액,
-  군복무 산입 승인 여부, 휴직 중 실제 기여금 납부 이력 등에 따라 달라질 수 있습니다.
+- 이 앱은 **공식 산정액이 아닌 추정용 베타 계산기**입니다.
+- 실제 지급액은 공무원연금공단의 **기준소득월액 이력**, **소득재분배 평균기준소득월액**, **군복무 산입 승인 여부**, **휴직 중 실제 기여금 납부 이력**, **제도 변경** 등에 따라 달라질 수 있습니다.
+- 현재 버전은 사용자가 구조를 이해하고 대략적인 규모를 감 잡는 데 목적이 있습니다.
+- 따라서 결과는 **대략적인 추정치**로만 활용해 주세요.
     """
 )

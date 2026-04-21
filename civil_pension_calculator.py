@@ -29,23 +29,10 @@ PENSION_RATES = {
 }
 
 # 인사혁신처 고시 연도별 전체 공무원 기준소득월액 평균액 (A값)
-# 2011년 제도가 도입된 이후의 모든 공식 고시 데이터를 포함합니다.
 OFFICIAL_A_VALUES = {
-    2011: 3950000,
-    2012: 4150000,
-    2013: 4350000,
-    2014: 4470000,
-    2015: 4670000,
-    2016: 4910000,
-    2017: 5100000,
-    2018: 5220000,
-    2019: 5300000,
-    2020: 5390000,
-    2021: 5350000,
-    2022: 5390000,
-    2023: 5440000,
-    2024: 5520000,
-    2025: 5710000,
+    2011: 3950000, 2012: 4150000, 2013: 4350000, 2014: 4470000, 2015: 4670000,
+    2016: 4910000, 2017: 5100000, 2018: 5220000, 2019: 5300000, 2020: 5390000,
+    2021: 5350000, 2022: 5390000, 2023: 5440000, 2024: 5520000, 2025: 5710000,
     2026: 5710000  # 2025년 고시액 기준 (2026년 4월까지 적용)
 }
 
@@ -108,15 +95,6 @@ def apply_service_cap(raw_y1: float, raw_y2: float, raw_y3: float, cap_years: in
     y3 = min(raw_y3, max(0.0, remaining))
     return y1, y2, y3
 
-def get_projected_a_value(retirement_year: int, salary_growth: float) -> float:
-    """퇴직 연도의 예상 A값을 최신 고시액 바탕으로 자동 추산"""
-    if retirement_year in OFFICIAL_A_VALUES:
-        return OFFICIAL_A_VALUES[retirement_year]
-    
-    latest_year = max(OFFICIAL_A_VALUES.keys())
-    years_diff = max(0, retirement_year - latest_year)
-    return OFFICIAL_A_VALUES[latest_year] * ((1 + salary_growth) ** years_diff)
-
 # =====================================
 # 핵심 계산 로직
 # =====================================
@@ -132,7 +110,6 @@ def calculate_pension(
     military_years = military_months / 12.0
     leave_years = leave_months / 12.0
     
-    # 순수 달력상 재직 기간 분리
     actual_start = float(entry_date.year + (entry_date.timetuple().tm_yday - 1) / 365.2425)
     actual_end = float(retirement_year + 1)
 
@@ -140,10 +117,8 @@ def calculate_pension(
     raw_y2 = overlap_years(actual_start, actual_end, 2010, 2016)
     raw_y3 = overlap_years(actual_start, actual_end, 2016, actual_end + 1)
 
-    # 1. 군복무 산입: 가장 과거인 1기간에 우선 합산 (소급 기여금 원리)
     raw_y1 += military_years
 
-    # 2. 제외 휴직 차감: 가장 최근인 3기간부터 역순으로 차감
     remaining_leave = leave_years
     deduct_y3 = min(raw_y3, remaining_leave)
     raw_y3 -= deduct_y3
@@ -156,28 +131,22 @@ def calculate_pension(
     deduct_y1 = min(raw_y1, remaining_leave)
     raw_y1 -= deduct_y1
 
-    # 2016년 이전 재직연수 및 상한 적용
     pre_2016_service_years = raw_y1 + raw_y2
     service_cap_years = recognized_service_cap(pre_2016_service_years)
     y1, y2, y3 = apply_service_cap(raw_y1, raw_y2, raw_y3, service_cap_years)
     recognized_service_years = y1 + y2 + y3
 
-    # 소득 추정치 세팅 (공단 서류가 없을 경우)
+    # ==========================================
+    # 💡 [논리 수정] 모든 기준을 "현재 물가(Present Value)"로 통일
+    # ==========================================
     current_standard_income = current_contribution / CONTRIBUTION_RATE if current_contribution > 0 else 0.0
-    projected_a_value = get_projected_a_value(retirement_year, salary_growth)
+    current_a_value = OFFICIAL_A_VALUES[max(OFFICIAL_A_VALUES.keys())] # 현재 고시된 최신 A값
     
-    # 직전 3년 평균 정확한 복리 계산 (y1용)
-    proj_ret = current_standard_income * ((1 + salary_growth) ** max(0, years_to_retire))
-    proj_1 = current_standard_income * ((1 + salary_growth) ** max(0, years_to_retire - 1))
-    proj_2 = current_standard_income * ((1 + salary_growth) ** max(0, years_to_retire - 2))
-    est_final_3_years = (proj_ret + proj_1 + proj_2) / 3.0
-    
-    # 소득재분배 법적 상한 적용 (내 소득(B)은 A값의 1.6배를 넘을 수 없음)
+    est_final_3_years = current_standard_income
     est_b_value = current_standard_income * 0.90
-    capped_est_b_value = min(est_b_value, projected_a_value * 1.6)
-    est_redist_value = (projected_a_value + capped_est_b_value) / 2
+    capped_est_b_value = min(est_b_value, current_a_value * 1.6)
+    est_redist_value = (current_a_value + capped_est_b_value) / 2
 
-    # 💡 [논리 수정] 재직연수가 0년인 구간은 기준 소득도 0원으로 강제 초기화
     base_p1_income, base_p2_income, base_p3_income = 0.0, 0.0, 0.0
     
     if y1 > 0:
@@ -187,7 +156,6 @@ def calculate_pension(
     if y3 > 0:
         base_p3_income = exact_redist_value if (use_exact_data and exact_redist_value > 0) else est_redist_value
 
-    # 구간별 연금 계산
     period1_monthly, period2_monthly, period3_monthly = 0.0, 0.0, 0.0
     
     if y1 > 0:
@@ -202,17 +170,21 @@ def calculate_pension(
         avg_rate_2016plus = weighted_average_rate(start_year_for_rate, start_year_for_rate + y3)
         period3_monthly = base_p3_income * y3 * (avg_rate_2016plus / 100)
 
-    estimated_monthly_pension = period1_monthly + period2_monthly + period3_monthly
+    # ==========================================
+    # 💡 [논리 수정] 연금액 가치 산출 정상화
+    # ==========================================
+    # 1. 위에서 계산된 합계는 '현재 물가 기준'의 연금액(Present Value)
+    present_value_monthly_pension = period1_monthly + period2_monthly + period3_monthly
+
+    # 2. 퇴직 시점의 액면가(미래 명목 가치)는 현재가치에 보수상승률을 복리로 적용하여 산출
+    estimated_monthly_pension = present_value_monthly_pension * ((1 + salary_growth) ** years_to_retire)
 
     pension_start_age = get_pension_start_age(entry_date, retirement_year)
-    pension_start_year = CURRENT_YEAR + max(0, pension_start_age - current_age)
     gap_years = max(0, pension_start_age - retirement_age)
     
-    present_value_monthly_pension = estimated_monthly_pension / ((1 + inflation) ** max(0, pension_start_year - CURRENT_YEAR))
-
     return {
         "current_standard_income": current_standard_income,
-        "projected_a_value": projected_a_value,
+        "current_a_value": current_a_value,
         "recognized_service_years": recognized_service_years,
         "service_cap_years": service_cap_years,
         "y1": y1, "y2": y2, "y3": y3,
@@ -253,11 +225,11 @@ with st.sidebar:
         exact_p1_value = st.number_input("2009년 이전 3년 평균 보수월액", value=0, step=10000, help="해당 없으면 0으로 두세요.")
     else:
         current_contribution = st.number_input("현재 매월 납부하는 일반기여금 (원)", min_value=0, value=396500, step=1000)
-        st.success("💡 **A값 자동 연동 중:** 인사혁신처 최신 고시액(5,710,000원)을 바탕으로 퇴직 시점의 소득재분배 A값이 추산됩니다.")
+        st.success("💡 **A값 자동 연동 중:** 인사혁신처 최신 고시액(5,710,000원)을 바탕으로 현재가치 기준 소득재분배가 연산됩니다.")
 
     st.divider()
     with st.expander("경제 지표 가정 (옵션)"):
-        salary_growth_pct = st.number_input("미래 연 보수상승률 (%)", value=2.50, step=0.1)
+        salary_growth_pct = st.number_input("미래 연 보수상승률 (%)", value=2.50, step=0.1, help="퇴직 시점의 명목 연금액(미래 가치)을 계산하는 데 사용됩니다.")
         inflation_pct = st.number_input("미래 연 물가상승률 (%)", value=2.00, step=0.1)
 
 # 계산 실행
@@ -272,8 +244,8 @@ res = calculate_pension(
 # 핵심 결과 출력
 st.subheader("💰 퇴직 시 예상 월 연금액")
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("퇴직 시점 명목 월연금", won(res["estimated_monthly_pension"]))
-c2.metric("현재가치 환산 월연금", won(res["present_value_monthly_pension"]))
+c1.metric("퇴직 시점 명목 월연금", won(res["estimated_monthly_pension"]), help="미래 퇴직 시점에 실제로 통장에 찍힐 예상 명목 금액입니다. (보수상승률 복리 적용)")
+c2.metric("현재가치 환산 월연금", won(res["present_value_monthly_pension"]), help="퇴직 시 받을 연금액을 현재 물가 수준(체감 가치)으로 환산한 금액입니다.")
 c3.metric("총 인정 재직기간", f"{res['recognized_service_years']:.1f}년 (최대 {res['service_cap_years']}년)")
 c4.metric("연금 개시 연령", f"{res['pension_start_age']}세 ({res['gap_years']}년 소득공백)")
 
@@ -284,7 +256,7 @@ left, right = st.columns([1, 1])
 
 with left:
     st.subheader("📊 적용된 기준 소득 (베이스 라인)")
-    st.caption("기본 모드일 경우 추정치, 정밀 모드일 경우 입력된 실데이터입니다.")
+    st.caption("모든 금액은 이해를 돕기 위해 '현재 가치(오늘 물가)'를 기준으로 표기됩니다.")
     income_df = pd.DataFrame({
         "적용 구간": ["1기간 (2009년 이전)", "2기간 (2010~2015년)", "3기간 (2016년 이후)"],
         "기준 소득": [won(res["base_p1_income"]), won(res["base_p2_income"]), won(res["base_p3_income"])]
@@ -296,7 +268,7 @@ with right:
     period_df = pd.DataFrame({
         "구간": ["1기간", "2기간", "3기간"],
         "적용 연수": [round(res["y1"], 2), round(res["y2"], 2), round(res["y3"], 2)],
-        "연금 기여분": [won(res["period1_monthly"]), won(res["period2_monthly"]), won(res["period3_monthly"])]
+        "연금 기여분 (현재가치)": [won(res["period1_monthly"]), won(res["period2_monthly"]), won(res["period3_monthly"])]
     })
     st.dataframe(period_df, use_container_width=True, hide_index=True)
 

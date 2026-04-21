@@ -18,6 +18,7 @@ RETIREMENT_AGE = 62
 CONTRIBUTION_RATE = 0.09
 DEFAULT_SALARY_GROWTH = 0.0252
 DEFAULT_INFLATION = 0.0209
+DEFAULT_PERIOD2_RATE = 0.019
 
 # 2016년 이후 지급률 단순화 테이블
 PENSION_RATES = {
@@ -133,7 +134,15 @@ class PensionResult:
 # =====================================
 # 핵심 계산 로직
 # =====================================
-def calculate_pension(current_contribution: int, current_age: int, entry_year: int) -> PensionResult:
+def calculate_pension(
+    current_contribution: int,
+    current_age: int,
+    entry_year: int,
+    retirement_age: int,
+    salary_growth: float,
+    inflation: float,
+    period2_rate: float,
+) -> PensionResult:
     """
     현재 일반기여금, 현재 나이, 임용연도만으로 대략적인 연금수령액을 추정한다.
     - 현재 기준소득월액 = 일반기여금 ÷ 9%
@@ -142,7 +151,7 @@ def calculate_pension(current_contribution: int, current_age: int, entry_year: i
     - 공단의 소득재분배 평균기준소득월액은 단순화하여 미반영
     """
     current_standard_income = current_contribution / CONTRIBUTION_RATE if current_contribution > 0 else 0.0
-    retirement_year = CURRENT_YEAR + max(0, RETIREMENT_AGE - current_age)
+    retirement_year = CURRENT_YEAR + max(0, retirement_age - current_age)
     years_to_retire = max(0, retirement_year - CURRENT_YEAR)
 
     # 기여금 납부 완료 가정, 별도 휴직 입력은 제거
@@ -150,9 +159,9 @@ def calculate_pension(current_contribution: int, current_age: int, entry_year: i
     pension_timeline_end = float(retirement_year)
 
     # 퇴직 시점 기준소득월액 추정
-    projected_retirement_income = current_standard_income * ((1 + DEFAULT_SALARY_GROWTH) ** years_to_retire)
-    projected_1_year_before = current_standard_income * ((1 + DEFAULT_SALARY_GROWTH) ** max(0, years_to_retire - 1))
-    projected_2_years_before = current_standard_income * ((1 + DEFAULT_SALARY_GROWTH) ** max(0, years_to_retire - 2))
+    projected_retirement_income = current_standard_income * ((1 + salary_growth) ** years_to_retire)
+    projected_1_year_before = current_standard_income * ((1 + salary_growth) ** max(0, years_to_retire - 1))
+    projected_2_years_before = current_standard_income * ((1 + salary_growth) ** max(0, years_to_retire - 2))
     average_final_3_years = (projected_retirement_income + projected_1_year_before + projected_2_years_before) / 3
 
     # 재직기간 구간 분리
@@ -166,7 +175,7 @@ def calculate_pension(current_contribution: int, current_age: int, entry_year: i
     else:
         period1_monthly = average_final_3_years * y1 * 0.025
 
-    period2_monthly = average_final_3_years * y2 * 0.019
+    period2_monthly = average_final_3_years * y2 * period2_rate
     avg_rate_2016plus = weighted_average_rate(max(2016, pension_timeline_start), pension_timeline_end)
     period3_monthly = average_final_3_years * y3 * (avg_rate_2016plus / 100)
 
@@ -174,8 +183,8 @@ def calculate_pension(current_contribution: int, current_age: int, entry_year: i
 
     pension_start_age = get_pension_start_age(entry_year, retirement_year)
     pension_start_year = CURRENT_YEAR + max(0, pension_start_age - current_age)
-    gap_years = max(0, pension_start_age - RETIREMENT_AGE)
-    present_value_monthly_pension = estimated_monthly_pension / ((1 + DEFAULT_INFLATION) ** max(0, pension_start_year - CURRENT_YEAR))
+    gap_years = max(0, pension_start_age - retirement_age)
+    present_value_monthly_pension = estimated_monthly_pension / ((1 + inflation) ** max(0, pension_start_year - CURRENT_YEAR))
 
     recognized_service_years = max(0.0, pension_timeline_end - pension_timeline_start)
 
@@ -216,10 +225,21 @@ with st.sidebar:
     current_age = st.number_input("현재 나이", min_value=20, max_value=80, value=33, step=1)
     entry_year = st.number_input("임용연도", min_value=1980, max_value=2060, value=2016, step=1)
 
+    st.divider()
+    st.header("기본 가정")
+    retirement_age = st.number_input("정년", min_value=55, max_value=70, value=RETIREMENT_AGE, step=1)
+    salary_growth_pct = st.number_input("연 보수상승률(%)", min_value=0.00, max_value=10.00, value=DEFAULT_SALARY_GROWTH * 100, step=0.01)
+    inflation_pct = st.number_input("연 물가상승률(%)", min_value=0.00, max_value=10.00, value=DEFAULT_INFLATION * 100, step=0.01)
+    period2_rate_pct = st.number_input("2기간 지급률(%)", min_value=0.00, max_value=5.00, value=DEFAULT_PERIOD2_RATE * 100, step=0.001)
+
 result = calculate_pension(
     current_contribution=int(current_contribution),
     current_age=int(current_age),
     entry_year=int(entry_year),
+    retirement_age=int(retirement_age),
+    salary_growth=float(salary_growth_pct) / 100,
+    inflation=float(inflation_pct) / 100,
+    period2_rate=float(period2_rate_pct) / 100,
 )
 
 st.info(
@@ -240,6 +260,44 @@ c5.metric("현재 나이", f"{result.current_age}세")
 c6.metric("예상 퇴직연도", f"{result.retirement_year}년")
 c7.metric("정년~개시 공백", f"{result.gap_years}년")
 c8.metric("총 인정 재직연수(단순)", f"{result.recognized_service_years:.1f}년")
+
+st.subheader("연금 계산 공식 설명")
+st.markdown(
+    """
+### 1) 현재 기준소득월액 역산
+- **현재 기준소득월액 = 현재 일반기여금 ÷ 9%**
+- 사용자가 입력한 일반기여금을 바탕으로 현재 공단상 기준소득월액을 역산합니다.
+
+### 2) 퇴직 시점 기준소득월액 추정
+- **퇴직 시점 기준소득월액 = 현재 기준소득월액 × (1 + 연 보수상승률)^(남은 연수)**
+- 마지막 3년 평균은 퇴직 시점, 1년 전, 2년 전 기준소득월액의 평균으로 단순 추정합니다.
+
+### 3) 재직기간을 1기간·2기간·3기간으로 분리
+- **1기간**: 2009년 말까지의 재직기간
+- **2기간**: 2010년 ~ 2015년 재직기간
+- **3기간**: 2016년 이후 재직기간
+- 공무원연금 개혁으로 시기별 산식과 지급률이 달라져서 기간을 나눠 계산합니다.
+
+### 4) 구간별 월연금 계산
+- **1기간 월연금**: 2009년 이전 규정에 따른 단순식 적용
+- **2기간 월연금**: 마지막 3년 평균 × 2기간 연수 × 2기간 지급률
+- **3기간 월연금**: 마지막 3년 평균 × 3기간 연수 × 2016년 이후 평균 지급률
+
+### 5) 최종 월연금
+- **최종 월연금 = 1기간 월연금 + 2기간 월연금 + 3기간 월연금**
+    """
+)
+
+st.subheader("1기간 · 2기간 · 3기간이란?")
+st.markdown(
+    """
+- **1기간**은 연금 개혁 이전인 **2009년 말까지**의 재직기간입니다.
+- **2기간**은 2010년 제도 변경 이후부터 2015년 말까지의 재직기간입니다.
+- **3기간**은 2016년 공무원연금 개혁 이후의 재직기간입니다.
+- 왜 나누냐면, **시기마다 적용되는 지급률과 계산 구조가 다르기 때문**입니다.
+- 그래서 같은 사람도 재직기간이 여러 시기에 걸쳐 있으면 **구간별로 따로 계산한 뒤 합산**합니다.
+    """
+)
 
 left, right = st.columns([1.15, 0.85])
 

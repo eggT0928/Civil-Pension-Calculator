@@ -277,6 +277,7 @@ def build_salary_breakdown(
     include_performance_bonus: bool,
     performance_grade: str,
     manual_income: int,
+    current_contribution_input: int,
     entry_year: int,
     military_months: int,
 ) -> SalaryBreakdown:
@@ -285,15 +286,16 @@ def build_salary_breakdown(
     adjusted_step = teacher_step + (1 if onejeong_step else 0) + (1 if graduate_step else 0)
     adjusted_step = clamp(adjusted_step, 1, 40)
 
-    if input_mode == "직접입력":
+    if input_mode == "기여금 입력":
+        inferred_income = float(current_contribution_input) / 0.09 if current_contribution_input > 0 else 0.0
         return SalaryBreakdown(
             adjusted_step=adjusted_step,
-            base_pay=float(manual_income),
+            base_pay=inferred_income,
             recurring_allowances=0.0,
             holiday_bonus_annual=0.0,
             regular_bonus_annual=0.0,
             performance_bonus_annual=0.0,
-            monthly_equivalent_income=float(manual_income),
+            monthly_equivalent_income=inferred_income,
             family_allowance_monthly=0.0,
             service_years_now=service_years_now,
         )
@@ -413,12 +415,12 @@ def calculate_pension(
 # 사이드바 입력
 # =====================================
 st.title("🏫 교사용 공무원연금 계산기")
-st.caption("GitHub에 올려 Streamlit Community Cloud로 배포하기 좋은 1파일 구조입니다.")
+st.caption("수령연금 추정을 위한 Streamlit 계산기입니다.")
 
 with st.sidebar:
     st.header("입력값")
 
-    input_mode = st.radio("기준소득월액 입력 방식", ["자동계산", "직접입력"], index=0)
+    input_mode = st.radio("입력 방식", ["기여금 입력", "호봉 추정"], index=0)
 
     entry_year = st.number_input("임용연도", min_value=1980, max_value=2060, value=2020, step=1)
     birth_year = st.number_input("출생연도", min_value=1950, max_value=2010, value=1993, step=1)
@@ -432,9 +434,11 @@ with st.sidebar:
     onejeong_step = st.checkbox("1정연수 +1호봉 가정", value=False)
     graduate_step = st.checkbox("대학원 +1호봉 가정", value=False)
 
+    current_contribution_input = 396500
     manual_income = 4200000
-    if input_mode == "직접입력":
-        manual_income = st.number_input("현재 기준소득월액(직접입력)", min_value=0, value=4200000, step=10000)
+    if input_mode == "기여금 입력":
+        current_contribution_input = st.number_input("현재 일반기여금", min_value=0, value=396500, step=1000)
+        st.caption("현재 일반기여금을 입력하면 기준소득월액을 자동으로 역산합니다. (기여금 ÷ 0.09)")
 
     include_teaching_allowance = st.checkbox("교직수당 반영", value=True)
     include_meal_allowance = st.checkbox("정액급식비 반영", value=True)
@@ -493,6 +497,7 @@ salary = build_salary_breakdown(
     include_performance_bonus=include_performance_bonus,
     performance_grade=performance_grade,
     manual_income=int(manual_income),
+    current_contribution_input=int(current_contribution_input),
     entry_year=int(entry_year),
     military_months=int(military_months),
 )
@@ -517,15 +522,15 @@ pension = calculate_pension(
 # =====================================
 st.info(
     "이 계산기는 공식 산정액이 아닌 추정용 베타입니다. "
-    "현재 버전은 구조 이해용이며, 실제 공무원연금공단의 기준소득월액 이력과 소득재분배 평균기준소득월액을 완전하게 재현하지 못합니다. "
-    "특히 현재 기여금과 예상 연금은 실제 공단 수치와 다를 수 있으므로 참고용으로만 활용해 주세요."
+    "현재 기본 입력은 일반기여금이며, 입력한 일반기여금으로 현재 기준소득월액을 역산해 연금 추정을 시작합니다. "
+    "다만 실제 공무원연금공단의 기준소득월액 이력과 소득재분배 평균기준소득월액을 완전하게 재현하지 못하므로 참고용으로만 활용해 주세요."
 )
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("현재 추정 기준소득월액", won(salary.monthly_equivalent_income))
 m2.metric("예상 월연금", won(pension.estimated_monthly_pension))
 m3.metric("현재가치 기준 월연금", won(pension.present_value_monthly_pension))
-m4.metric("현재 월 기여금(9%)", won(pension.current_monthly_contribution))
+m4.metric("현재 입력 기여금 기준 추정", won(pension.current_monthly_contribution))
 
 m5, m6, m7, m8 = st.columns(4)
 m5.metric("현재 나이", f"{pension.current_age}세")
@@ -540,24 +545,24 @@ with left:
     detail_df = pd.DataFrame(
         {
             "항목": [
-                "조정 후 호봉",
-                "호봉 기준 본봉",
-                "가족수당(월)",
-                "매월 수당 합계",
-                "명절휴가비(연)",
-                "정근수당(연)",
-                f"성과급({performance_grade}등급, 연)",
-                "월환산 기준소득 추정치",
+                "입력 방식",
+                "조정 후 호봉(호봉 추정 모드 참고용)",
+                "현재 기준소득월액 추정/역산",
+                "가족수당(월, 호봉 추정 모드)",
+                "매월 수당 합계(호봉 추정 모드)",
+                "명절휴가비(연, 호봉 추정 모드)",
+                "정근수당(연, 호봉 추정 모드)",
+                f"성과급({performance_grade}등급, 호봉 추정 모드)",
             ],
             "값": [
+                input_mode,
                 f"{salary.adjusted_step}호봉",
-                won(salary.base_pay),
+                won(salary.monthly_equivalent_income),
                 won(salary.family_allowance_monthly),
                 won(salary.recurring_allowances),
                 won(salary.holiday_bonus_annual),
                 won(salary.regular_bonus_annual),
                 won(salary.performance_bonus_annual),
-                won(salary.monthly_equivalent_income),
             ],
         }
     )
@@ -603,7 +608,7 @@ with right:
     st.markdown(
         """
 - **성과급**: 2026 교육공무원 12개월 근무 기준 지급액 사용
-- **담임수당**: 25만 원 가정
+- **담임수당**: 20만 원 가정
 - **보직교사수당**: 15만 원 가정
 - **명절휴가비**: 월봉급액의 60% × 연 2회
 - **정근수당**: 근무연수별 비율 × 연 2회
@@ -616,7 +621,7 @@ st.markdown(
     """
 - 이 앱은 **공식 산정액이 아닌 추정용 베타 계산기**입니다.
 - 실제 지급액은 공무원연금공단의 **기준소득월액 이력**, **소득재분배 평균기준소득월액**, **군복무 산입 승인 여부**, **휴직 중 실제 기여금 납부 이력**, **제도 변경** 등에 따라 달라질 수 있습니다.
-- 현재 버전은 사용자가 구조를 이해하고 대략적인 규모를 감 잡는 데 목적이 있습니다.
+- 현재 기본 입력은 **일반기여금**이며, 이를 통해 현재 기준소득월액을 역산합니다.
 - 따라서 결과는 **대략적인 추정치**로만 활용해 주세요.
     """
 )

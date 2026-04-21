@@ -19,13 +19,21 @@ CONTRIBUTION_RATE = 0.09
 DEFAULT_SALARY_GROWTH = 0.025
 DEFAULT_INFLATION = 0.020
 
-# 2016년 이후 지급률 인하 테이블
+# 2016년 이후 지급률 단계적 인하 테이블
 PENSION_RATES = {
     2016: 1.878, 2017: 1.856, 2018: 1.834, 2019: 1.812,
     2020: 1.790, 2021: 1.780, 2022: 1.770, 2023: 1.760,
     2024: 1.750, 2025: 1.740, 2026: 1.736, 2027: 1.732,
     2028: 1.728, 2029: 1.724, 2030: 1.720, 2031: 1.716,
     2032: 1.712, 2033: 1.708, 2034: 1.704, 2035: 1.700,
+}
+
+# 인사혁신처 고시 연도별 전체 공무원 기준소득월액 평균액 (A값)
+OFFICIAL_A_VALUES = {
+    2023: 5440000,
+    2024: 5520000,
+    2025: 5710000,
+    2026: 5710000  # 2025년 고시액 기준 (2026년 4월까지 적용)
 }
 
 # =====================================
@@ -91,13 +99,23 @@ def apply_service_cap(raw_y1: float, raw_y2: float, raw_y3: float, cap_years: in
     y3 = min(raw_y3, max(0.0, remaining))
     return y1, y2, y3
 
+def get_projected_a_value(retirement_year: int, salary_growth: float) -> float:
+    """퇴직 연도의 예상 A값을 최신 고시액 바탕으로 자동 추산"""
+    if retirement_year in OFFICIAL_A_VALUES:
+        return OFFICIAL_A_VALUES[retirement_year]
+    
+    # 미래 연도 퇴직 시, 가장 최근 고시액에 보수상승률을 복리 적용하여 추정
+    latest_year = max(OFFICIAL_A_VALUES.keys())
+    years_diff = max(0, retirement_year - latest_year)
+    return OFFICIAL_A_VALUES[latest_year] * ((1 + salary_growth) ** years_diff)
+
 # =====================================
 # 핵심 계산 로직
 # =====================================
 def calculate_pension(
     current_age: int, entry_date: date, retirement_age: int, 
     military_months: int, leave_months: int,
-    current_contribution: int, salary_growth: float, inflation: float, a_value: float,
+    current_contribution: int, salary_growth: float, inflation: float,
     use_exact_data: bool, exact_b_value: float, exact_redist_value: float, exact_p1_value: float
 ):
     years_to_retire = max(0, retirement_age - current_age)
@@ -121,12 +139,13 @@ def calculate_pension(
 
     # 소득 추정 또는 실데이터 적용
     current_standard_income = current_contribution / CONTRIBUTION_RATE if current_contribution > 0 else 0.0
+    projected_a_value = get_projected_a_value(retirement_year, salary_growth)
     
-    # 기본 추정치 세팅
+    # 기본 추정치 세팅 (공단 서류가 없을 경우)
     est_final_3_years = current_standard_income * ((1 + salary_growth) ** max(0, years_to_retire - 1)) 
     est_b_value = current_standard_income * 0.90 # 현재 소득의 90% 수준으로 평생 소득 임의 추정
-    est_redist_value = (a_value + est_b_value) / 2
-    est_redist_value = min(est_redist_value, a_value * 1.6)
+    est_redist_value = (projected_a_value + est_b_value) / 2
+    est_redist_value = min(est_redist_value, projected_a_value * 1.6)
 
     # 적용 소득 결정 (정밀 모드 vs 기본 모드)
     base_p1_income = exact_p1_value if (use_exact_data and exact_p1_value > 0) else est_final_3_years
@@ -154,6 +173,7 @@ def calculate_pension(
 
     return {
         "current_standard_income": current_standard_income,
+        "projected_a_value": projected_a_value,
         "recognized_service_years": recognized_service_years,
         "service_cap_years": service_cap_years,
         "y1": y1, "y2": y2, "y3": y3,
@@ -167,7 +187,7 @@ def calculate_pension(
 # =====================================
 # 화면 구성
 # =====================================
-st.title("🏛️ 범용 공무원연금 시뮬레이터")
+st.title("🏛️ 공무원연금 시뮬레이터 (범용/정밀)")
 st.markdown("임용 연도와 관계없이 **모든 공무원**이 사용할 수 있습니다. 공단 서류가 있다면 더 정확한 계산이 가능합니다.")
 
 with st.sidebar:
@@ -186,7 +206,6 @@ with st.sidebar:
     
     current_contribution = 0
     exact_b_value, exact_redist_value, exact_p1_value = 0.0, 0.0, 0.0
-    a_value = 5500000
 
     if use_exact_data:
         st.info("퇴직급여예상액 내역서 하단의 **'적용보수'** 표를 보고 입력하세요.")
@@ -195,7 +214,7 @@ with st.sidebar:
         exact_p1_value = st.number_input("2009년 이전 3년 평균 보수월액", value=0, step=10000, help="2009년 이전 재직자만 입력 (해당 없으면 0)")
     else:
         current_contribution = st.number_input("현재 매월 납부하는 일반기여금 (원)", min_value=0, value=396500, step=1000)
-        a_value = st.number_input("전체 공무원 평균소득 (A값 임의설정)", value=5500000, step=100000)
+        st.success("💡 **A값 자동 연동 중:** 인사혁신처가 고시한 가장 최근 전체 공무원 평균소득(5,710,000원)을 바탕으로 퇴직 시점의 A값이 자동 추산됩니다.")
 
     st.divider()
     with st.expander("경제 지표 가정 (옵션)"):
@@ -207,7 +226,7 @@ res = calculate_pension(
     current_age=int(current_age), entry_date=entry_date, retirement_age=int(retirement_age),
     military_months=int(military_months), leave_months=int(leave_months),
     current_contribution=int(current_contribution), 
-    salary_growth=float(salary_growth_pct)/100, inflation=float(inflation_pct)/100, a_value=a_value,
+    salary_growth=float(salary_growth_pct)/100, inflation=float(inflation_pct)/100,
     use_exact_data=use_exact_data, exact_b_value=exact_b_value, exact_redist_value=exact_redist_value, exact_p1_value=exact_p1_value
 )
 
@@ -226,7 +245,7 @@ left, right = st.columns([1, 1])
 
 with left:
     st.subheader("📊 적용된 기준 소득 (베이스 라인)")
-    st.caption("기본 모드일 경우 추정치, 정밀 모드일 경우 입력된 실데이터입니다.")
+    st.caption("기본 모드일 경우 추정치(A값 등 자동연산), 정밀 모드일 경우 입력된 실데이터입니다.")
     income_df = pd.DataFrame({
         "적용 구간": ["1기간 (2009년 이전)", "2기간 (2010~2015년)", "3기간 (2016년 이후)"],
         "기준 소득": [won(res["base_p1_income"]), won(res["base_p2_income"]), won(res["base_p3_income"])]
@@ -243,6 +262,6 @@ with right:
     st.dataframe(period_df, use_container_width=True, hide_index=True)
 
 if use_exact_data:
-    st.success("✅ 공무원연금공단의 실제 데이터를 반영하여 현재 기준 가장 정확도 높은 계산이 적용되었습니다. (향후 보수인상률 등에 따라 소폭 변동 가능)")
+    st.success("✅ 공무원연금공단의 실제 데이터를 반영하여 현재 기준 가장 정확도 높은 계산이 적용되었습니다.")
 else:
     st.warning("⚠️ 현재 기여금만을 바탕으로 한 '기본 추정 모드'입니다. 실제 서류가 있다면 사이드바에서 [데이터 직접 입력]을 켜주세요.")

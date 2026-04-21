@@ -145,14 +145,15 @@ def calculate_pension(
     capped_est_b_value = min(est_b_value, current_a_value * 1.6)
     est_redist_value = (current_a_value + capped_est_b_value) / 2
 
-    base_p1_income, base_p2_income, base_p3_income = 0.0, 0.0, 0.0
-    
-    if y1 > 0:
-        base_p1_income = exact_p1_value if (use_exact_data and exact_p1_value > 0) else est_final_3_years
-    if y2 > 0:
-        base_p2_income = exact_b_value if (use_exact_data and exact_b_value > 0) else capped_est_b_value
-    if y3 > 0:
-        base_p3_income = exact_redist_value if (use_exact_data and exact_redist_value > 0) else est_redist_value
+    # [수정] 실제 수학 계산용 변수 (0원으로 초기화되지 않음)
+    actual_p1_value = exact_p1_value if (use_exact_data and exact_p1_value > 0) else est_final_3_years
+    actual_b_value = exact_b_value if (use_exact_data and exact_b_value > 0) else capped_est_b_value
+    actual_p3_value = exact_redist_value if (use_exact_data and exact_redist_value > 0) else est_redist_value
+
+    # UI 화면 표기용 변수 (해당 구간 근무가 없으면 0원 표기)
+    base_p1_income = actual_p1_value if y1 > 0 else 0.0
+    base_p2_income = actual_b_value if y2 > 0 else 0.0
+    base_p3_income = actual_p3_value if y3 > 0 else 0.0
 
     # ==========================================
     # 1. 퇴직연금액 계산 (현재 가치)
@@ -190,14 +191,14 @@ def calculate_pension(
     final_income_pv = current_standard_income
     allowance_pv = final_income_pv * total_years * allowance_rate
     
-    # 퇴직연금일시금 산출
+    # [수정] 퇴직연금일시금 산출 (실제 B값 사용)
     lump_sum_1_pv = 0.0
     if y1 > 0:
         excess_5 = max(0.0, y1 - 5.0)
-        lump_sum_1_pv = base_p1_income * y1 * (0.975 + excess_5 * 0.0065)
+        lump_sum_1_pv = actual_p1_value * y1 * (0.975 + excess_5 * 0.0065)
         
-    # 2, 3기간 일시금: B값 * 재직연수 * 1.17 (월 기준 9.75%)
-    lump_sum_23_pv = base_p2_income * (y2 + y3) * 1.17
+    # 2, 3기간 일시금: 실제 평균소득(actual_b_value) * 2,3기간 재직연수 * 1.17
+    lump_sum_23_pv = actual_b_value * (y2 + y3) * 1.17
     lump_sum_total_pv = lump_sum_1_pv + lump_sum_23_pv
     
     # 명목 가치(미래)로 환산

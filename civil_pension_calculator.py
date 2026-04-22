@@ -148,51 +148,59 @@ def get_pension_start_age(entry_date: date, retirement_year: int) -> int:
     return 60
 
 # =====================================
-# 엑셀/CSV 데이터 초정밀 파싱 로직 
+# 엑셀/CSV 데이터 초정밀 파싱 로직 (업그레이드)
 # =====================================
 def parse_pension_file(file) -> dict:
-    """CSV, XLS 파일에서 셀 구조의 장점을 활용해 데이터를 오차 없이 추출"""
+    """CSV, XLS, HTML 등 공단의 잡다한 파일 구조를 모두 뚫고 들어가는 강력한 파서"""
     extracted_data = {}
     try:
-        filename = file.name.lower()
+        raw_bytes = file.getvalue()
         text = ""
         
-        # 1. 파일 텍스트화 (공단의 가짜 xls(HTML) 및 CSV 모두 커버하는 범용 디코딩)
-        try:
-            text = file.getvalue().decode('cp949') # 한국 공공기관 표준 인코딩
-        except UnicodeDecodeError:
+        # 1. 파일 텍스트화 (EUC-KR, CP949, UTF-8 등 모든 한국어 인코딩 시도)
+        for encoding in ['cp949', 'euc-kr', 'utf-8']:
             try:
-                text = file.getvalue().decode('utf-8')
-            except Exception:
-                # 일반 엑셀 파일일 경우 Pandas로 읽어서 문자열로 변환
+                text = raw_bytes.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+                
+        # 텍스트 디코딩 실패 시 엑셀 라이브러리로 강제 읽기 시도
+        if not text:
+            try:
                 df = pd.read_excel(file)
                 text = df.to_string()
+            except Exception:
+                pass
 
-        # 2. 정규식 추출 (셀 구분이 쉼표나 탭 등으로 나뉘어 있어 완벽한 매칭 가능)
+        # 2. 방해물 제거 (HTML 태그, CSV 따옴표, 불필요한 줄바꿈 등을 공백으로 치환)
+        text = re.sub(r'<[^>]+>', ' ', text)  # HTML 태그 제거
+        text = text.replace('"', ' ').replace("'", " ") # 따옴표 제거
         
-        # 임용일 추출 (예: 2016-03-01, 2016/03/01, 2016.03.01)
+        # 3. 초강력 정규식 추출 (핵심 키워드 뒤에 등장하는 첫 번째 금액 패턴 매칭)
+        # 임용일 추출 (2016-03-01, 2016/03/01, 2016.03.01 등)
         date_match = re.search(r'임용일.*?(\d{4})[./-](\d{2})[./-](\d{2})', text)
         if date_match:
             extracted_data['entry_date'] = date(int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3)))
             
-        # 개인 평균 기준소득월액 (글자 이후 처음 등장하는 6자리 이상 금액)
-        b_match = re.search(r'개인\s*평균\s*기준소득월액\D*?([\d,]{6,})', text)
+        # 개인 평균 기준소득월액 (키워드 이후 100만원~2000만원 사이 정상 금액만)
+        b_match = re.search(r'개인\s*평균.*?(?P<num>\d{1,3}(?:,\d{3})+|\d{6,})', text)
         if b_match:
-            val = int(b_match.group(1).replace(',', ''))
-            if 1000000 <= val <= 20000000:  # 비정상 데이터 방어
+            val = int(b_match.group('num').replace(',', ''))
+            if 1000000 <= val <= 20000000:
                 extracted_data['b_value'] = val
                 
         # 소득재분배 반영 기준소득월액
-        redist_match = re.search(r'소득재분배\s*반영\D*?([\d,]{6,})', text)
+        redist_match = re.search(r'소득재분배.*?(?P<num>\d{1,3}(?:,\d{3})+|\d{6,})', text)
         if redist_match:
-            val = int(redist_match.group(1).replace(',', ''))
+            val = int(redist_match.group('num').replace(',', ''))
             if 1000000 <= val <= 20000000:
                 extracted_data['redist_value'] = val
                 
-        # 2009년 이전 평균 보수월액 (해당자만 존재)
-        p1_match = re.search(r'2009년\s*이전.*?보수월액\D*?([\d,]{6,})', text)
+        # 2009년 이전 평균 보수월액
+        p1_match = re.search(r'2009년\s*이전.*?(?P<num>\d{1,3}(?:,\d{3})+|\d{6,})', text)
         if p1_match:
-            val = int(p1_match.group(1).replace(',', ''))
+            val = int(p1_match.group('num').replace(',', ''))
             if 1000000 <= val <= 20000000:
                 extracted_data['p1_value'] = val
 

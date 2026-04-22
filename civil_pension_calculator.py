@@ -148,26 +148,38 @@ def get_pension_start_age(entry_date: date, retirement_year: int) -> int:
     return 60
 
 # =====================================
-# 엑셀/CSV 데이터 초정밀 파싱 로직 (다중 시트 완벽 스나이핑)
+# 궁극의 파일 파서 (데이터 생략 차단 및 에러 추적 강화)
 # =====================================
 def parse_pension_file(file) -> dict:
-    """엑셀의 다중 시트(Sheet) 문제와 표 빈칸(NaN, 콤마) 찌꺼기를 완벽히 해결한 파서"""
+    """Pandas의 '...' 데이터 생략을 방지하고 모든 텍스트를 살려내는 무적 파서"""
     extracted_data = {}
     try:
-        file.seek(0) # 스트림릿 파일 포인터 초기화
+        file.seek(0)
         filename = file.name.lower()
         text = ""
         
-        # 1. 진짜 엑셀(.xls, .xlsx)인 경우 숨겨진 시트(Sheet)까지 모조리 합침
+        # 1. 엑셀 파일인 경우 (.xls, .xlsx)
         if filename.endswith(('.xls', '.xlsx')):
             try:
-                # sheet_name=None 옵션이 핵심! (Page 2, Page 3까지 모두 스캔)
                 dfs = pd.read_excel(file, sheet_name=None)
-                text = " ".join([df.to_string() for df in dfs.values()])
+                # 💡 핵심 수정: to_string() 대신 to_csv()를 써서 '...'으로 데이터가 생략되는 것을 원천 차단!
+                text = " ".join([df.to_csv(index=False, header=False, na_rep="") for df in dfs.values()])
+            except ImportError:
+                st.error("엑셀 파일을 읽기 위한 라이브러리가 부족합니다. 터미널에 'pip install openpyxl'을 입력해 설치해 주세요.")
+                return {}
             except Exception:
+                # 공단 파일이 HTML을 엑셀로 속인 경우 패스 (아래 텍스트 디코딩으로 넘어감)
                 pass
         
-        # 2. 엑셀 파싱 실패 시(또는 CSV인 경우) 텍스트 강제 디코딩
+        # 2. PDF 파일인 경우
+        elif filename.endswith('.pdf'):
+            import PyPDF2
+            reader = PyPDF2.PdfReader(file)
+            for page in reader.pages:
+                extracted_text = page.extract_text()
+                if extracted_text: text += extracted_text + " "
+                
+        # 3. 엑셀 파싱 실패 시 또는 일반 CSV/텍스트 강제 디코딩
         if not text:
             file.seek(0)
             raw_bytes = file.getvalue()
@@ -177,52 +189,47 @@ def parse_pension_file(file) -> dict:
                     break
                 except UnicodeDecodeError:
                     continue
-                    
-        # HTML 찌꺼기 및 따옴표 제거 후 한 줄로 펼치기
-        text = re.sub(r'<[^>]+>', ' ', text)
-        text = text.replace('"', ' ').replace("'", " ").replace('\n', ' ')
+        
+        if not text:
+            st.error("파일에서 글자를 읽어올 수 없습니다. 손상된 파일이거나 암호가 걸려있는지 확인해주세요.")
+            return {}
 
-        # 3. 데이터 정밀 타격 함수 (단어 발견 후 200자 이내의 유효한 값만 픽업)
-        def extract_value(keyword, is_date=False):
-            match = re.search(keyword, text)
-            if not match: return None
+        # 4. 방해물 제거 및 진공 압축
+        text = re.sub(r'<[^>]+>', ' ', text) # HTML 태그 제거
+        text = text.replace('"', '').replace("'", "")
+        clean_text = re.sub(r'\s+', '', text) # 모든 공백/줄바꿈 완벽 압축
+        
+        # 5. 데이터 스나이핑 (정규식)
+        date_match = re.search(r'임용일.*?(\d{4})[./-년](\d{1,2})[./-월](\d{1,2})', clean_text)
+        if date_match:
+            extracted_data['entry_date'] = date(int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3)))
             
-            # 키워드 발견 지점부터 200자 이내의 텍스트만 스캔 (안전성 극대화)
-            snippet = text[match.end():match.end()+200]
-            
-            if is_date:
-                # yyyy-mm-dd, yyyy/mm/dd, yyyy.mm.dd 포맷 탐색
-                d_match = re.search(r'(\d{4})\s*[./-년]\s*(\d{1,2})\s*[./-월]\s*(\d{1,2})', snippet)
-                if d_match:
-                    return date(int(d_match.group(1)), int(d_match.group(2)), int(d_match.group(3)))
-            else:
-                # 금액 포맷 탐색 (콤마 유무 상관없이 추출)
+        def extract_amount(keyword):
+            match = re.search(keyword, clean_text)
+            if match:
+                snippet = clean_text[match.end():match.end()+100]
                 amounts = re.findall(r'[1-9]\d{0,2}(?:,\d{3})+|[1-9]\d{5,}', snippet)
                 for amt in amounts:
                     val = int(amt.replace(',', ''))
-                    # 100만원 이상 3000만원 이하의 상식적인 소득액만 픽업 (0이나 단순 페이지 번호 무시)
+                    # 100만 원 이상 3000만 원 이하의 상식적 소득액만 픽업
                     if 1000000 <= val <= 30000000:
                         return val
             return None
 
-        # 값 추출 실행
-        entry_date = extract_value(r'임용일', is_date=True)
-        if entry_date: extracted_data['entry_date'] = entry_date
-        
-        b_val = extract_value(r'개인\s*평균\s*기준소득월액')
+        # 정확도 높은 키워드 탐색
+        b_val = extract_amount(r'개인평균(?:기준소득월액)?')
         if b_val: extracted_data['b_value'] = b_val
         
-        redist_val = extract_value(r'소득재분배\s*반영')
+        redist_val = extract_amount(r'소득재분배(?:반영|적용)?(?:기준소득월액)?')
         if redist_val: extracted_data['redist_value'] = redist_val
         
-        p1_val = extract_value(r'2009년\s*이전.*?보수월액')
+        p1_val = extract_amount(r'2009년이전.*?보수월액')
         if p1_val: extracted_data['p1_value'] = p1_val
 
     except Exception as e:
-        st.error(f"파일을 분석하는 중 오류가 발생했습니다: {e}")
+        st.error(f"파일 분석 로직 자체에 오류가 발생했습니다: {e}")
         
     return extracted_data
-
 # =====================================
 # 핵심 계산 로직
 # =====================================

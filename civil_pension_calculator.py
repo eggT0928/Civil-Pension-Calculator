@@ -99,6 +99,19 @@ def years_between(start_date: date, end_date: date) -> float:
 def year_fraction(d: date) -> float:
     return d.year + ((d.timetuple().tm_yday - 1) / 365.2425)
 
+def get_default_retirement_date(current_age: int, job_type: str) -> date:
+    """직종에 따른 정년퇴직일 자동 계산"""
+    retire_age = 60 if "일반공무원" in job_type else 62
+    years_left = max(0, retire_age - current_age)
+    retire_year = CURRENT_YEAR + years_left
+    
+    if "교원" in job_type:
+        # 교원 정년퇴직: 2월 말일 (윤년 오류 방지를 위해 3월 1일에서 1일을 뺌)
+        return date(retire_year, 3, 1) - timedelta(days=1)
+    else:
+        # 일반공무원 하반기 정년퇴직: 12월 31일
+        return date(retire_year, 12, 31)
+
 def pension_rate_for_year(year: int) -> float:
     if year in PENSION_RATES: return PENSION_RATES[year]
     if year < 2016: return 1.9
@@ -142,7 +155,6 @@ def retirement_allowance_rate(total_years: float) -> float:
     return 0.39
 
 def get_pension_start_age(entry_date: date, retirement_year: int) -> int:
-    """1996.1.1 이후 임용자는 퇴직연도별 지급개시연령 표를 완벽히 적용"""
     if entry_date >= date(1996, 1, 1):
         if retirement_year <= 2021: return 60
         elif retirement_year <= 2023: return 61
@@ -156,7 +168,6 @@ def get_pension_start_age(entry_date: date, retirement_year: int) -> int:
 # 핵심 계산 로직
 # =====================================
 def calculate_service_years(entry_date: date, retirement_date: date) -> dict:
-    """사용자가 입력한 퇴직일까지의 실제 날짜(Days) 기반 재직연수 산출"""
     actual_start = year_fraction(entry_date)
     actual_end = year_fraction(retirement_date)
 
@@ -187,17 +198,15 @@ def calculate_pension(inputs: Inputs) -> Result:
     current_standard_income = inputs.current_contribution / CONTRIBUTION_RATE if inputs.current_contribution > 0 else 0.0
     current_a_value = OFFICIAL_A_VALUES[max(OFFICIAL_A_VALUES.keys())]
     
-    # 추정 모드 기초 소득
     est_b_value = current_standard_income * 0.90
     capped_b = min(est_b_value, current_a_value * 1.6)
     est_redist = (current_a_value + capped_b) / 2
 
-    # 정밀 모드 vs 추정 모드 값 결정 (계산용)
     actual_p1_value = inputs.exact_p1_value if (inputs.use_exact_data and inputs.exact_p1_value > 0) else current_standard_income
     actual_b_value = inputs.exact_b_value if (inputs.use_exact_data and inputs.exact_b_value > 0) else capped_b
     actual_p3_value = inputs.exact_redist_value if (inputs.use_exact_data and inputs.exact_redist_value > 0) else est_redist
 
-    # 1. 월 연금액 산출 (현재 물가 기준)
+    # 월 연금액 산출
     period1_monthly_today = 0.0
     if service["y1"] > 0:
         if service["y1"] >= 20: period1_monthly_today = actual_p1_value * 0.5 + actual_p1_value * (service["y1"] - 20) * 0.02
@@ -211,12 +220,11 @@ def calculate_pension(inputs: Inputs) -> Result:
         avg_rate_2016plus = weighted_average_rate(period3_start, period3_start + service["y3"])
         period3_monthly_today = actual_p3_value * service["y3"] * (avg_rate_2016plus / 100)
 
-    # 연금 명목가치(미래통장 찍힐 금액)와 진정한 현재가치(물가할인액) 분리
     base_pension_today = period1_monthly_today + period2_monthly_today + period3_monthly_today
     monthly_pension_fv = base_pension_today * ((1 + inputs.salary_growth) ** years_to_retire)
     real_monthly_pension_pv = monthly_pension_fv / ((1 + inputs.inflation) ** years_to_retire)
 
-    # 2. 퇴직수당 및 연금일시금 산출
+    # 퇴직수당 및 연금일시금 산출
     projected_final_income_fv = current_standard_income * ((1 + inputs.salary_growth) ** years_to_retire)
     allow_rate = retirement_allowance_rate(service["recognized_service_years"])
     
@@ -257,30 +265,23 @@ st.markdown("본인의 데이터를 직접 입력하여 정확도 높은 예상 
 with st.sidebar:
     st.header("1. 기본 정보")
     
-    # 디폴트 값 모두 제거 (None 적용)
+    job_type = st.radio("직종 선택", ["일반공무원 (정년 60세)", "교원 (정년 62세)"])
+    
     current_contribution = st.number_input("현재 매월 납부하는 일반기여금 (원)", min_value=0, value=None, step=1000, placeholder="예: 396500")
     current_age = st.number_input("현재 나이 (세)", min_value=20, max_value=80, value=None, placeholder="예: 33")
+    entry_date = st.date_input("최초임용일", value=None, min_value=date(1970, 1, 1), max_value=date(2100, 12, 31))
     
-    # 💡 [오류 해결] min_value, max_value를 넉넉하게 지정하여 Streamlit 에러 방지
-    entry_date = st.date_input(
-        "최초임용일", 
-        value=None, 
-        min_value=date(1970, 1, 1), 
-        max_value=date(2100, 12, 31)
-    )
-    
-    retirement_date = st.date_input(
-        "예상 퇴직일", 
+    retirement_date_input = st.date_input(
+        "예상 퇴직일 (선택)", 
         value=None, 
         min_value=date(2000, 1, 1), 
         max_value=date(2100, 12, 31), 
-        help="원하시는 임의의 퇴직 날짜를 입력하시면 해당 기간만큼 정확하게 계산됩니다."
+        help="비워두시면 선택하신 직종의 정년을 기준으로 자동 계산됩니다."
     )
 
     st.divider()
     st.header("2. 공단 서류 보정")
     use_exact_data = st.toggle("✅ 예상퇴직급여내역서 적용보수 값 사용", value=True)
-    
     exact_b_value, exact_redist_value, exact_p1_value = 0.0, 0.0, 0.0
 
     if use_exact_data:
@@ -304,19 +305,24 @@ missing_inputs = []
 if current_contribution is None: missing_inputs.append("현재 일반기여금")
 if current_age is None: missing_inputs.append("현재 나이")
 if entry_date is None: missing_inputs.append("최초임용일")
-if retirement_date is None: missing_inputs.append("예상 퇴직일")
 
 if use_exact_data:
     if exact_b_value is None: missing_inputs.append("개인 평균 기준소득월액 (B값)")
     if exact_redist_value is None: missing_inputs.append("소득재분배 반영 기준소득월액")
-    if exact_p1_value is None: exact_p1_value = 0.0  # 1기간이 없는 사용자가 많으므로 기본값 0 처리 허용
+    if exact_p1_value is None: exact_p1_value = 0.0
 
-# 필수값이 하나라도 비어있으면 계산을 중지하고 안내 메시지 출력
 if missing_inputs:
     st.info(f"👈 좌측 사이드바에서 다음 필수 정보를 입력해주세요: **{', '.join(missing_inputs)}**")
     st.stop()
 
-# 모든 값이 입력되었을 경우에만 아래 계산 및 출력 로직 실행
+# 💡 [자동 계산] 예상 퇴직일을 비워둔 경우 직종에 맞춰 자동 계산
+if retirement_date_input is None:
+    retirement_date = get_default_retirement_date(int(current_age), job_type)
+    st.info(f"💡 예상 퇴직일이 입력되지 않아, 선택하신 직종의 정년을 기준으로 **{retirement_date.strftime('%Y년 %m월 %d일')}**로 자동 설정되어 계산되었습니다.")
+else:
+    retirement_date = retirement_date_input
+
+# 계산 실행
 inputs = Inputs(
     current_age=int(current_age), entry_date=entry_date, retirement_date=retirement_date,
     current_contribution=int(current_contribution), salary_growth=float(salary_growth_pct) / 100,
@@ -327,6 +333,9 @@ inputs = Inputs(
 
 res = calculate_pension(inputs)
 
+# =====================================
+# 결과 화면 출력
+# =====================================
 st.subheader("💰 퇴직 시 예상 월 연금액")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("월 연금 (물가할인 현재가치)", won(res.monthly_pension_pv), help="미래의 명목 연금액을 물가상승률로 할인하여 체감 가치로 보여줍니다.")
@@ -374,12 +383,3 @@ if inputs.use_exact_data:
     st.success("✅ 공단 서류(예상퇴직급여내역서) 데이터를 바탕으로 산출된 고정밀 추정치입니다.")
 else:
     st.warning("⚠️ 현재 기여금만을 바탕으로 과거 소득을 추정한 모드입니다. 정확도를 높이려면 사이드바에서 서류 데이터를 입력하세요.")
-
-st.subheader("주의")
-st.markdown(
-    """
-- 이 앱은 **공단 서류 데이터를 바탕으로 시뮬레이션하는 추정용 앱**입니다.
-- **물가할인 현재가치**는 향후 발생하는 '명목 연금액'을 설정한 물가상승률로 할인하여, 현재 물가 체감 수준으로 역산한 값입니다.
-- 실제 최종 지급액은 공무원연금공단의 **세액 및 대부금 공제 이력, 경과규정, 향후 법 개정** 등에 따라 차이가 발생할 수 있습니다.
-    """
-)

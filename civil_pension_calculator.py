@@ -399,17 +399,65 @@ def extract_date_near_keyword(text: str, keyword_patterns: list[str]) -> date | 
     return None
 
 
-def extract_amount_near_keyword(text: str, keyword_patterns: list[str], min_value: int = 0, max_value: int = 999999999) -> int | None:
+def extract_all_amounts(text: str, min_value: int = 0, max_value: int = 999999999) -> list[int]:
     amount_pattern = r"([1-9]\d{0,2}(?:,\d{3})+|[1-9]\d{5,})"
+    values = []
+    for amt in re.findall(amount_pattern, text):
+        val = int(amt.replace(",", ""))
+        if min_value <= val <= max_value:
+            values.append(val)
+    return values
+
+
+def extract_amount_near_keyword(text: str, keyword_patterns: list[str], min_value: int = 0, max_value: int = 999999999) -> int | None:
     for kw in keyword_patterns:
         m = re.search(kw, text, flags=re.IGNORECASE)
         if not m:
             continue
         snippet = text[m.start(): m.start() + 220]
-        for amt in re.findall(amount_pattern, snippet):
-            val = int(amt.replace(",", ""))
-            if min_value <= val <= max_value:
-                return val
+        values = extract_all_amounts(snippet, min_value=min_value, max_value=max_value)
+        if values:
+            return values[0]
+    return None
+
+
+def extract_b_and_redist_values(text: str) -> tuple[int | None, int | None]:
+    patterns = [
+        r"개인\s*평균\s*기준소득월액.*?소득재분배\s*반영\s*평균\s*기준소득월액",
+        r"평균\s*기준소득월액.*?개인\s*평균\s*기준소득월액.*?소득재분배\s*반영",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if not m:
+            continue
+        snippet = text[m.end(): m.end() + 180]
+        values = extract_all_amounts(snippet, min_value=1000000, max_value=30000000)
+        if len(values) >= 2:
+            return values[-2], values[-1]
+    return None, None
+
+
+def infer_age_from_rrn(text: str) -> int | None:
+    patterns = [
+        r"(\d{2})(\d{2})(\d{2})\s*[- ]\s*([1-4])\*+",
+        r"주민등록번호\s*(\d{2})(\d{2})(\d{2})\s*[- ]\s*([1-4])",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if not m:
+            continue
+        yy = int(m.group(1))
+        mm = int(m.group(2))
+        dd = int(m.group(3))
+        code = m.group(4)
+        century = 1900 if code in {"1", "2"} else 2000
+        try:
+            birth_date = date(century + yy, mm, dd)
+            age = CURRENT_DATE.year - birth_date.year - ((CURRENT_DATE.month, CURRENT_DATE.day) < (birth_date.month, birth_date.day))
+            if 20 <= age <= 80:
+                return age
+        except Exception:
+            pass
     return None
 
 
@@ -424,27 +472,35 @@ def parse_pension_file(uploaded_file) -> dict[str, Any]:
     if entry_date:
         parsed["entry_date"] = entry_date
 
-    b_value = extract_amount_near_keyword(
-        text,
-        [r"개인\s*평균\s*기준소득월액", r"B값"],
-        min_value=1000000,
-        max_value=30000000,
-    )
+    b_value, redist_value = extract_b_and_redist_values(text)
     if b_value:
         parsed["b_value"] = b_value
-
-    redist_value = extract_amount_near_keyword(
-        text,
-        [r"소득재분배\s*반영\s*평균\s*기준소득월액", r"소득재분배\s*반영\s*기준소득월액"],
-        min_value=1000000,
-        max_value=30000000,
-    )
     if redist_value:
         parsed["redist_value"] = redist_value
 
+    if not parsed.get("b_value"):
+        b_value = extract_amount_near_keyword(
+            text,
+            [r"개인\s*평균\s*기준소득월액", r"B값"],
+            min_value=1000000,
+            max_value=30000000,
+        )
+        if b_value:
+            parsed["b_value"] = b_value
+
+    if not parsed.get("redist_value"):
+        redist_value = extract_amount_near_keyword(
+            text,
+            [r"소득재분배\s*반영\s*평균\s*기준소득월액", r"소득재분배\s*반영\s*기준소득월액"],
+            min_value=1000000,
+            max_value=30000000,
+        )
+        if redist_value:
+            parsed["redist_value"] = redist_value
+
     p1_value = extract_amount_near_keyword(
         text,
-        [r"2009\.12\.31\.\s*이전기간", r"2009년\s*이전.*보수월액", r"1기간.*보수월액"],
+        [r"2009\.12\.31\.\s*이전기간.*?연금", r"2009년\s*이전.*보수월액", r"1기간.*보수월액"],
         min_value=1,
         max_value=30000000,
     )
@@ -462,7 +518,7 @@ def parse_pension_file(uploaded_file) -> dict[str, Any]:
 
     current_contribution = extract_amount_near_keyword(
         text,
-        [r"기여금", r"일반기여금"],
+        [r"일반기여금", r"기여금"],
         min_value=10000,
         max_value=5000000,
     )
@@ -477,6 +533,15 @@ def parse_pension_file(uploaded_file) -> dict[str, Any]:
     )
     if pension_amount:
         parsed["reference_pension_monthly"] = pension_amount
+
+    inferred_age = infer_age_from_rrn(text)
+    if inferred_age:
+        parsed["current_age"] = inferred_age
+
+    if parsed.get("current_standard_income") and not parsed.get("current_contribution"):
+        inferred_contribution = int(round((parsed["current_standard_income"] * CONTRIBUTION_RATE) / 10) * 10)
+        if 10000 <= inferred_contribution <= 5000000:
+            parsed["current_contribution"] = inferred_contribution
 
     return parsed
 
@@ -630,7 +695,9 @@ DEFAULT_SESSION_VALUES = {
     "doc_p1_value": 0,
     "doc_current_contribution": None,
     "doc_reference_pension": None,
+    "doc_current_age": None,
     "file_parse_message": "",
+    "last_uploaded_signature": None,
 }
 for key, val in DEFAULT_SESSION_VALUES.items():
     if key not in st.session_state:
@@ -650,7 +717,7 @@ with st.sidebar:
     current_contribution = st.number_input(
         "현재 매월 납부하는 일반기여금 (원)",
         min_value=0,
-        value=st.session_state.doc_current_contribution if st.session_state.doc_current_contribution else None,
+        value=st.session_state.doc_current_contribution if st.session_state.doc_current_contribution is not None else None,
         step=1000,
         placeholder="예: 396500",
     )
@@ -658,7 +725,7 @@ with st.sidebar:
         "현재 나이 (세)",
         min_value=20,
         max_value=80,
-        value=None,
+        value=st.session_state.doc_current_age if st.session_state.doc_current_age is not None else None,
         placeholder="예: 33",
     )
     entry_date = st.date_input(
@@ -684,21 +751,29 @@ with st.sidebar:
     )
 
     if uploaded_file is not None:
-        parsed = parse_pension_file(uploaded_file)
-        if parsed:
-            if parsed.get("entry_date"):
-                st.session_state.doc_entry_date = parsed["entry_date"]
-            if parsed.get("b_value"):
-                st.session_state.doc_b_value = parsed["b_value"]
-            if parsed.get("redist_value"):
-                st.session_state.doc_redist_value = parsed["redist_value"]
-            if parsed.get("p1_value") is not None:
-                st.session_state.doc_p1_value = parsed["p1_value"]
-            if parsed.get("current_contribution"):
-                st.session_state.doc_current_contribution = parsed["current_contribution"]
-            st.session_state.file_parse_message = "✅ 파일 분석 성공! 찾은 값들을 아래 입력칸에 반영했습니다."
-        else:
-            st.session_state.file_parse_message = "❌ 파일에서 필요한 데이터를 찾지 못했습니다. 직접 입력해주세요."
+        file_signature = (uploaded_file.name, uploaded_file.size)
+        if st.session_state.last_uploaded_signature != file_signature:
+            parsed = parse_pension_file(uploaded_file)
+            if parsed:
+                if parsed.get("entry_date"):
+                    st.session_state.doc_entry_date = parsed["entry_date"]
+                if parsed.get("b_value"):
+                    st.session_state.doc_b_value = parsed["b_value"]
+                if parsed.get("redist_value"):
+                    st.session_state.doc_redist_value = parsed["redist_value"]
+                if parsed.get("p1_value") is not None:
+                    st.session_state.doc_p1_value = parsed["p1_value"]
+                if parsed.get("current_contribution"):
+                    st.session_state.doc_current_contribution = parsed["current_contribution"]
+                if parsed.get("reference_pension_monthly"):
+                    st.session_state.doc_reference_pension = parsed["reference_pension_monthly"]
+                if parsed.get("current_age"):
+                    st.session_state.doc_current_age = parsed["current_age"]
+                st.session_state.file_parse_message = "✅ 파일 분석 성공! 찾은 값들을 아래 입력칸에 반영했습니다."
+            else:
+                st.session_state.file_parse_message = "❌ 파일에서 필요한 데이터를 찾지 못했습니다. 직접 입력해주세요."
+            st.session_state.last_uploaded_signature = file_signature
+            st.rerun()
 
     if st.session_state.file_parse_message:
         if st.session_state.file_parse_message.startswith("✅"):
@@ -716,7 +791,7 @@ with st.sidebar:
             "개인 평균 기준소득월액 (B값)",
             min_value=0,
             max_value=30000000,
-            value=st.session_state.doc_b_value if st.session_state.doc_b_value else None,
+            value=st.session_state.doc_b_value if st.session_state.doc_b_value is not None else None,
             step=10000,
             placeholder="예: 3807467",
         )
@@ -724,7 +799,7 @@ with st.sidebar:
             "소득재분배 반영 기준소득월액",
             min_value=0,
             max_value=30000000,
-            value=st.session_state.doc_redist_value if st.session_state.doc_redist_value else None,
+            value=st.session_state.doc_redist_value if st.session_state.doc_redist_value is not None else None,
             step=10000,
             placeholder="예: 5076495",
         )
@@ -891,8 +966,9 @@ st.subheader("주의")
 st.markdown(
     """
 - 이 앱은 **공식 산정액이 아닌 추정용 시뮬레이터**입니다.
+- 업로드 파일에서 **임용일 / 개인 평균 기준소득월액(B값) / 소득재분배 반영 기준소득월액 / 현재 일반기여금 / 연금월액 / 현재 나이(가능한 경우)** 를 자동 추출하도록 개선했습니다.
+- 현재 나이는 파일에 **주민등록번호 앞 6자리와 성별코드가 남아 있는 경우에만** 자동 추정됩니다.
 - PDF는 `pypdf`, XLSX는 `pandas` 실패 시 **ZIP/XML fallback** 으로 다시 읽도록 개선했습니다.
-- 업로드 파일은 **임용일 / 개인 평균 기준소득월액(B값) / 소득재분배 반영 기준소득월액 / 일부 기여금/기준소득월액** 등을 자동 추출합니다.
 - 연금월액은 공무원연금의 **1기간 / 2기간 / 3기간** 구조를 따라 추정합니다.
 - 개시연령은 **1996.1.1 이후 임용자 기준 퇴직연도별 표**를 반영합니다.
 - 재직기간 상한은 **2016.1.1 현재 재직기간**에 따라 33/34/35/36년을 적용합니다.

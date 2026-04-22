@@ -1,7 +1,9 @@
+import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
+import PyPDF2  # PDF 추출을 위한 라이브러리 추가
 import streamlit as st
 
 # =====================================
@@ -20,7 +22,6 @@ DEFAULT_SALARY_GROWTH = 0.025
 DEFAULT_INFLATION = 0.020
 DEFAULT_PERIOD2_RATE = 0.019
 
-# 2016년 이후 지급률 단계적 인하 테이블
 PENSION_RATES = {
     2016: 1.878, 2017: 1.856, 2018: 1.834, 2019: 1.812,
     2020: 1.790, 2021: 1.780, 2022: 1.770, 2023: 1.760,
@@ -29,7 +30,6 @@ PENSION_RATES = {
     2032: 1.712, 2033: 1.708, 2034: 1.704, 2035: 1.700,
 }
 
-# 인사혁신처 고시 전체 공무원 기준소득월액 평균액(A값) (2011~2026)
 OFFICIAL_A_VALUES = {
     2011: 3950000, 2012: 4150000, 2013: 4350000, 2014: 4470000, 2015: 4670000,
     2016: 4910000, 2017: 5100000, 2018: 5220000, 2019: 5300000, 2020: 5390000,
@@ -38,7 +38,7 @@ OFFICIAL_A_VALUES = {
 }
 
 # =====================================
-# 데이터 클래스
+# 데이터 클래스 및 유틸 함수
 # =====================================
 @dataclass
 class Inputs:
@@ -61,34 +61,19 @@ class Result:
     retirement_age_est: float
     pension_start_age: int
     gap_years: float
-
     current_standard_income: float
     current_a_value: float
-
     pre_2016_service_years: float
     service_cap_years: int
     recognized_service_years: float
     raw_y1: float; raw_y2: float; raw_y3: float
     y1: float; y2: float; y3: float
+    base_p1_income: float; base_p2_income: float; base_p3_income: float
+    monthly_pension_pv: float; monthly_pension_fv: float
+    period1_monthly_pv: float; period2_monthly_pv: float; period3_monthly_pv: float
+    retirement_allowance_pv: float; retirement_allowance_fv: float
+    pension_lump_sum_pv: float; pension_lump_sum_fv: float
 
-    base_p1_income: float
-    base_p2_income: float
-    base_p3_income: float
-
-    monthly_pension_pv: float
-    monthly_pension_fv: float
-    period1_monthly_pv: float
-    period2_monthly_pv: float
-    period3_monthly_pv: float
-
-    retirement_allowance_pv: float
-    retirement_allowance_fv: float
-    pension_lump_sum_pv: float
-    pension_lump_sum_fv: float
-
-# =====================================
-# 유틸 함수
-# =====================================
 def won(value: float) -> str:
     return f"{int(round(value)):,}원"
 
@@ -100,16 +85,12 @@ def year_fraction(d: date) -> float:
     return d.year + ((d.timetuple().tm_yday - 1) / 365.2425)
 
 def get_default_retirement_date(current_age: int, job_type: str) -> date:
-    """직종에 따른 정년퇴직일 자동 계산"""
     retire_age = 60 if "일반공무원" in job_type else 62
     years_left = max(0, retire_age - current_age)
     retire_year = CURRENT_YEAR + years_left
-    
     if "교원" in job_type:
-        # 교원 정년퇴직: 2월 말일 (윤년 오류 방지를 위해 3월 1일에서 1일을 뺌)
         return date(retire_year, 3, 1) - timedelta(days=1)
     else:
-        # 일반공무원 하반기 정년퇴직: 12월 31일
         return date(retire_year, 12, 31)
 
 def pension_rate_for_year(year: int) -> float:
@@ -165,6 +146,40 @@ def get_pension_start_age(entry_date: date, retirement_year: int) -> int:
     return 60
 
 # =====================================
+# PDF 자동 파싱 로직 (Killer Feature)
+# =====================================
+def parse_pension_pdf(file) -> dict:
+    """PDF 파일에서 텍스트를 추출하여 임용일, B값, 소득재분배값을 찾아냅니다."""
+    extracted_data = {}
+    try:
+        reader = PyPDF2.PdfReader(file)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        
+        # 정규표현식을 활용한 데이터 색인
+        # 1. 임용일 추출 (예: 임용일 2016/03/01)
+        entry_match = re.search(r'임용일.*?(\d{4}/\d{2}/\d{2})', text)
+        if entry_match:
+            extracted_data['entry_date'] = datetime.strptime(entry_match.group(1), '%Y/%m/%d').date()
+            
+        # 2. 개인 평균 기준소득월액 (B값) (예: 3,807,467)
+        # 여러 개가 잡힐 수 있으므로, 해당 키워드 주변의 첫 번째 금액 포맷 매칭
+        b_match = re.search(r'개인\s*평균\s*기준소득월액\D*?([\d,]{5,})', text)
+        if b_match:
+            extracted_data['b_value'] = int(b_match.group(1).replace(',', ''))
+            
+        # 3. 소득재분배 반영 기준소득월액 (예: 5,076,495)
+        redist_match = re.search(r'소득재분배\s*반영\D*?([\d,]{5,})', text)
+        if redist_match:
+            extracted_data['redist_value'] = int(redist_match.group(1).replace(',', ''))
+
+    except Exception as e:
+        st.error(f"PDF를 분석하는 중 오류가 발생했습니다: {e}")
+        
+    return extracted_data
+
+# =====================================
 # 핵심 계산 로직
 # =====================================
 def calculate_service_years(entry_date: date, retirement_date: date) -> dict:
@@ -191,9 +206,7 @@ def calculate_pension(inputs: Inputs) -> Result:
     years_to_retire = max(0.0, years_between(CURRENT_DATE, inputs.retirement_date))
     retirement_age_est = inputs.current_age + years_to_retire
 
-    service = calculate_service_years(
-        entry_date=inputs.entry_date, retirement_date=inputs.retirement_date
-    )
+    service = calculate_service_years(inputs.entry_date, inputs.retirement_date)
 
     current_standard_income = inputs.current_contribution / CONTRIBUTION_RATE if inputs.current_contribution > 0 else 0.0
     current_a_value = OFFICIAL_A_VALUES[max(OFFICIAL_A_VALUES.keys())]
@@ -206,7 +219,6 @@ def calculate_pension(inputs: Inputs) -> Result:
     actual_b_value = inputs.exact_b_value if (inputs.use_exact_data and inputs.exact_b_value > 0) else capped_b
     actual_p3_value = inputs.exact_redist_value if (inputs.use_exact_data and inputs.exact_redist_value > 0) else est_redist
 
-    # 월 연금액 산출
     period1_monthly_today = 0.0
     if service["y1"] > 0:
         if service["y1"] >= 20: period1_monthly_today = actual_p1_value * 0.5 + actual_p1_value * (service["y1"] - 20) * 0.02
@@ -224,7 +236,6 @@ def calculate_pension(inputs: Inputs) -> Result:
     monthly_pension_fv = base_pension_today * ((1 + inputs.salary_growth) ** years_to_retire)
     real_monthly_pension_pv = monthly_pension_fv / ((1 + inputs.inflation) ** years_to_retire)
 
-    # 퇴직수당 및 연금일시금 산출
     projected_final_income_fv = current_standard_income * ((1 + inputs.salary_growth) ** years_to_retire)
     allow_rate = retirement_allowance_rate(service["recognized_service_years"])
     
@@ -257,10 +268,18 @@ def calculate_pension(inputs: Inputs) -> Result:
     )
 
 # =====================================
+# 세션 상태 초기화 (Session State)
+# =====================================
+# PDF 업로드 시 추출된 데이터를 화면에 유지하기 위해 사용합니다.
+if "pdf_entry_date" not in st.session_state: st.session_state.pdf_entry_date = None
+if "pdf_b_value" not in st.session_state: st.session_state.pdf_b_value = None
+if "pdf_redist_value" not in st.session_state: st.session_state.pdf_redist_value = None
+
+# =====================================
 # 화면 구성 (UI)
 # =====================================
 st.title("🏛️ 공무원연금 시뮬레이터 (추정/서류기반 정밀모드)")
-st.markdown("본인의 데이터를 직접 입력하여 정확도 높은 예상 연금액을 확인하세요.")
+st.markdown("본인의 데이터를 직접 입력하거나 **예상퇴직급여내역서 PDF를 업로드**하여 정확도 높은 예상 연금액을 확인하세요.")
 
 with st.sidebar:
     st.header("1. 기본 정보")
@@ -269,28 +288,37 @@ with st.sidebar:
     
     current_contribution = st.number_input("현재 매월 납부하는 일반기여금 (원)", min_value=0, value=None, step=1000, placeholder="예: 396500")
     current_age = st.number_input("현재 나이 (세)", min_value=20, max_value=80, value=None, placeholder="예: 33")
-    entry_date = st.date_input("최초임용일", value=None, min_value=date(1970, 1, 1), max_value=date(2100, 12, 31))
+    entry_date = st.date_input("최초임용일", value=st.session_state.pdf_entry_date, min_value=date(1970, 1, 1), max_value=date(2100, 12, 31))
     
     retirement_date_input = st.date_input(
-        "예상 퇴직일 (선택)", 
-        value=None, 
-        min_value=date(2000, 1, 1), 
-        max_value=date(2100, 12, 31), 
+        "예상 퇴직일 (선택)", value=None, min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), 
         help="비워두시면 선택하신 직종의 정년을 기준으로 자동 계산됩니다."
     )
 
     st.divider()
-    st.header("2. 공단 서류 보정")
-    use_exact_data = st.toggle("✅ 예상퇴직급여내역서 적용보수 값 사용", value=True)
+    st.header("2. 공단 서류 보정 (선택)")
+    
+    # 💡 [Killer Feature] PDF 파일 업로더 추가
+    uploaded_file = st.file_uploader("📂 내 예상퇴직급여내역서 PDF 업로드", type=["pdf"], help="공단 홈페이지에서 다운받은 PDF를 올리면 숫자가 자동 입력됩니다.")
+    
+    if uploaded_file is not None:
+        extracted = parse_pension_pdf(uploaded_file)
+        if extracted:
+            st.success("✅ 파일 분석 성공! 해당 데이터를 아래 입력칸에 자동으로 채웠습니다.")
+            # 추출된 데이터를 세션 상태에 저장하여 화면에 반영
+            st.session_state.pdf_entry_date = extracted.get('entry_date', st.session_state.pdf_entry_date)
+            st.session_state.pdf_b_value = extracted.get('b_value', st.session_state.pdf_b_value)
+            st.session_state.pdf_redist_value = extracted.get('redist_value', st.session_state.pdf_redist_value)
+        else:
+            st.error("❌ 파일에서 필요 데이터를 찾지 못했습니다. 직접 입력해주세요.")
+            
+    use_exact_data = st.toggle("✅ 적용보수 값 사용", value=True)
     exact_b_value, exact_redist_value, exact_p1_value = 0.0, 0.0, 0.0
 
     if use_exact_data:
-        st.info("퇴직급여예상액 내역서 하단의 **'적용보수'** 표를 보고 입력하세요.")
-        exact_b_value = st.number_input("개인 평균 기준소득월액 (B값)", min_value=0, value=None, step=10000, placeholder="예: 3807467")
-        exact_redist_value = st.number_input("소득재분배 반영 기준소득월액", min_value=0, value=None, step=10000, placeholder="예: 5076495")
+        exact_b_value = st.number_input("개인 평균 기준소득월액 (B값)", min_value=0, value=st.session_state.pdf_b_value, step=10000, placeholder="예: 3807467")
+        exact_redist_value = st.number_input("소득재분배 반영 기준소득월액", min_value=0, value=st.session_state.pdf_redist_value, step=10000, placeholder="예: 5076495")
         exact_p1_value = st.number_input("2009년 이전 평균 보수월액 (선택)", min_value=0, value=None, step=10000, placeholder="해당 없으면 비워두세요.")
-    else:
-        st.warning("⚠️ 기여금만으로는 과거 소득 이력을 알 수 없어 연금액 오차가 발생합니다.")
 
     st.divider()
     with st.expander("경제 지표 가정"):
@@ -315,14 +343,12 @@ if missing_inputs:
     st.info(f"👈 좌측 사이드바에서 다음 필수 정보를 입력해주세요: **{', '.join(missing_inputs)}**")
     st.stop()
 
-# 💡 [자동 계산] 예상 퇴직일을 비워둔 경우 직종에 맞춰 자동 계산
 if retirement_date_input is None:
     retirement_date = get_default_retirement_date(int(current_age), job_type)
-    st.info(f"💡 예상 퇴직일이 입력되지 않아, 선택하신 직종의 정년을 기준으로 **{retirement_date.strftime('%Y년 %m월 %d일')}**로 자동 설정되어 계산되었습니다.")
+    st.info(f"💡 예상 퇴직일이 비어있어 선택하신 직종 정년 기준인 **{retirement_date.strftime('%Y년 %m월 %d일')}**로 자동 계산되었습니다.")
 else:
     retirement_date = retirement_date_input
 
-# 계산 실행
 inputs = Inputs(
     current_age=int(current_age), entry_date=entry_date, retirement_date=retirement_date,
     current_contribution=int(current_contribution), salary_growth=float(salary_growth_pct) / 100,
@@ -346,7 +372,6 @@ c4.metric("연금 개시 연령", f"{res.pension_start_age}세 ({res.gap_years:.
 st.divider()
 
 st.subheader("💼 퇴직 시 예상 일시금액 (수당 및 연금일시금)")
-st.markdown("공무원은 퇴직 시 **'연금 + 퇴직수당'**을 받거나, 연금을 포기하고 **'연금일시금 + 퇴직수당'**을 목돈으로 한 번에 수령할 수 있습니다.")
 d1, d2, d3, d4 = st.columns(4)
 d1.metric("퇴직수당 (현재가치)", won(res.retirement_allowance_pv))
 d2.metric("퇴직수당 (명목가치)", won(res.retirement_allowance_fv))

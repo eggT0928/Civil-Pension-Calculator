@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 import pandas as pd
-import PyPDF2  # PDF 추출을 위한 라이브러리 추가
+import PyPDF2
 import streamlit as st
 
 # =====================================
@@ -146,33 +146,44 @@ def get_pension_start_age(entry_date: date, retirement_year: int) -> int:
     return 60
 
 # =====================================
-# PDF 자동 파싱 로직 (Killer Feature)
+# PDF 자동 파싱 로직 (안전장치 강화)
 # =====================================
 def parse_pension_pdf(file) -> dict:
-    """PDF 파일에서 텍스트를 추출하여 임용일, B값, 소득재분배값을 찾아냅니다."""
+    """PDF에서 숫자가 뭉쳐서 추출되는 JS Bounds Error를 방지하는 스마트 파서"""
     extracted_data = {}
     try:
         reader = PyPDF2.PdfReader(file)
         text = ""
         for page in reader.pages:
-            text += page.extract_text() + "\n"
+            text += page.extract_text() + " "
         
-        # 정규표현식을 활용한 데이터 색인
-        # 1. 임용일 추출 (예: 임용일 2016/03/01)
+        # 1. 임용일 추출
         entry_match = re.search(r'임용일.*?(\d{4}/\d{2}/\d{2})', text)
         if entry_match:
             extracted_data['entry_date'] = datetime.strptime(entry_match.group(1), '%Y/%m/%d').date()
             
-        # 2. 개인 평균 기준소득월액 (B값) (예: 3,807,467)
-        # 여러 개가 잡힐 수 있으므로, 해당 키워드 주변의 첫 번째 금액 포맷 매칭
-        b_match = re.search(r'개인\s*평균\s*기준소득월액\D*?([\d,]{5,})', text)
-        if b_match:
-            extracted_data['b_value'] = int(b_match.group(1).replace(',', ''))
-            
-        # 3. 소득재분배 반영 기준소득월액 (예: 5,076,495)
-        redist_match = re.search(r'소득재분배\s*반영\D*?([\d,]{5,})', text)
-        if redist_match:
-            extracted_data['redist_value'] = int(redist_match.group(1).replace(',', ''))
+        # 2. B값 안전 추출 (100만원 ~ 2천만원 사이의 상식적인 금액만 통과)
+        b_idx = text.find("개인 평균 기준소득월액")
+        if b_idx != -1:
+            snippet = text[b_idx:b_idx+300]
+            # 쉼표가 들어간 금액 포맷(예: 3,807,467) 또는 6~8자리 숫자만 정밀 타격
+            amounts = re.findall(r'\d{1,3}(?:,\d{3})+|\d{6,8}', snippet)
+            for amount in reversed(amounts):
+                val = int(amount.replace(',', ''))
+                if 1000000 <= val <= 20000000:  # 에러 방지용 상한선 캡 적용
+                    extracted_data['b_value'] = val
+                    break
+                    
+        # 3. 소득재분배 반영값 안전 추출
+        redist_idx = text.find("소득재분배")
+        if redist_idx != -1:
+            snippet = text[redist_idx:redist_idx+300]
+            amounts = re.findall(r'\d{1,3}(?:,\d{3})+|\d{6,8}', snippet)
+            for amount in reversed(amounts):
+                val = int(amount.replace(',', ''))
+                if 1000000 <= val <= 20000000:
+                    extracted_data['redist_value'] = val
+                    break
 
     except Exception as e:
         st.error(f"PDF를 분석하는 중 오류가 발생했습니다: {e}")
@@ -268,12 +279,17 @@ def calculate_pension(inputs: Inputs) -> Result:
     )
 
 # =====================================
-# 세션 상태 초기화 (Session State)
+# 세션 상태 초기화 (안전장치 포함)
 # =====================================
-# PDF 업로드 시 추출된 데이터를 화면에 유지하기 위해 사용합니다.
 if "pdf_entry_date" not in st.session_state: st.session_state.pdf_entry_date = None
 if "pdf_b_value" not in st.session_state: st.session_state.pdf_b_value = None
 if "pdf_redist_value" not in st.session_state: st.session_state.pdf_redist_value = None
+
+# 이전 런타임에서 저장된 비정상 값이 있으면 안전하게 초기화
+if st.session_state.pdf_b_value and st.session_state.pdf_b_value > 20000000:
+    st.session_state.pdf_b_value = None
+if st.session_state.pdf_redist_value and st.session_state.pdf_redist_value > 20000000:
+    st.session_state.pdf_redist_value = None
 
 # =====================================
 # 화면 구성 (UI)
@@ -298,14 +314,12 @@ with st.sidebar:
     st.divider()
     st.header("2. 공단 서류 보정 (선택)")
     
-    # 💡 [Killer Feature] PDF 파일 업로더 추가
     uploaded_file = st.file_uploader("📂 내 예상퇴직급여내역서 PDF 업로드", type=["pdf"], help="공단 홈페이지에서 다운받은 PDF를 올리면 숫자가 자동 입력됩니다.")
     
     if uploaded_file is not None:
         extracted = parse_pension_pdf(uploaded_file)
         if extracted:
-            st.success("✅ 파일 분석 성공! 해당 데이터를 아래 입력칸에 자동으로 채웠습니다.")
-            # 추출된 데이터를 세션 상태에 저장하여 화면에 반영
+            st.success("✅ 파일 분석 성공! 데이터를 아래 입력칸에 자동으로 채웠습니다.")
             st.session_state.pdf_entry_date = extracted.get('entry_date', st.session_state.pdf_entry_date)
             st.session_state.pdf_b_value = extracted.get('b_value', st.session_state.pdf_b_value)
             st.session_state.pdf_redist_value = extracted.get('redist_value', st.session_state.pdf_redist_value)
@@ -316,9 +330,10 @@ with st.sidebar:
     exact_b_value, exact_redist_value, exact_p1_value = 0.0, 0.0, 0.0
 
     if use_exact_data:
-        exact_b_value = st.number_input("개인 평균 기준소득월액 (B값)", min_value=0, value=st.session_state.pdf_b_value, step=10000, placeholder="예: 3807467")
-        exact_redist_value = st.number_input("소득재분배 반영 기준소득월액", min_value=0, value=st.session_state.pdf_redist_value, step=10000, placeholder="예: 5076495")
-        exact_p1_value = st.number_input("2009년 이전 평균 보수월액 (선택)", min_value=0, value=None, step=10000, placeholder="해당 없으면 비워두세요.")
+        # 💡 [안전장치 추가] max_value를 명시하여 JS Bounds Error 이중 방어
+        exact_b_value = st.number_input("개인 평균 기준소득월액 (B값)", min_value=0, max_value=30000000, value=st.session_state.pdf_b_value, step=10000, placeholder="예: 3807467")
+        exact_redist_value = st.number_input("소득재분배 반영 기준소득월액", min_value=0, max_value=30000000, value=st.session_state.pdf_redist_value, step=10000, placeholder="예: 5076495")
+        exact_p1_value = st.number_input("2009년 이전 평균 보수월액 (선택)", min_value=0, max_value=30000000, value=None, step=10000, placeholder="해당 없으면 비워두세요.")
 
     st.divider()
     with st.expander("경제 지표 가정"):
@@ -372,6 +387,7 @@ c4.metric("연금 개시 연령", f"{res.pension_start_age}세 ({res.gap_years:.
 st.divider()
 
 st.subheader("💼 퇴직 시 예상 일시금액 (수당 및 연금일시금)")
+st.markdown("공무원은 퇴직 시 **'연금 + 퇴직수당'**을 받거나, 연금을 포기하고 **'연금일시금 + 퇴직수당'**을 목돈으로 한 번에 수령할 수 있습니다.")
 d1, d2, d3, d4 = st.columns(4)
 d1.metric("퇴직수당 (현재가치)", won(res.retirement_allowance_pv))
 d2.metric("퇴직수당 (명목가치)", won(res.retirement_allowance_fv))

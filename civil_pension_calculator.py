@@ -260,8 +260,22 @@ with st.sidebar:
     # 디폴트 값 모두 제거 (None 적용)
     current_contribution = st.number_input("현재 매월 납부하는 일반기여금 (원)", min_value=0, value=None, step=1000, placeholder="예: 396500")
     current_age = st.number_input("현재 나이 (세)", min_value=20, max_value=80, value=None, placeholder="예: 33")
-    entry_date = st.date_input("최초임용일", value=None)
-    retirement_date = st.date_input("예상 퇴직일", value=None, help="원하시는 임의의 퇴직 날짜를 입력하시면 해당 기간만큼 정확하게 계산됩니다.")
+    
+    # 💡 [오류 해결] min_value, max_value를 넉넉하게 지정하여 Streamlit 에러 방지
+    entry_date = st.date_input(
+        "최초임용일", 
+        value=None, 
+        min_value=date(1970, 1, 1), 
+        max_value=date(2100, 12, 31)
+    )
+    
+    retirement_date = st.date_input(
+        "예상 퇴직일", 
+        value=None, 
+        min_value=date(2000, 1, 1), 
+        max_value=date(2100, 12, 31), 
+        help="원하시는 임의의 퇴직 날짜를 입력하시면 해당 기간만큼 정확하게 계산됩니다."
+    )
 
     st.divider()
     st.header("2. 공단 서류 보정")

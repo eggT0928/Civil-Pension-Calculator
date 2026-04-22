@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 import pandas as pd
-import PyPDF2
 import streamlit as st
 
 # =====================================
@@ -149,48 +148,56 @@ def get_pension_start_age(entry_date: date, retirement_year: int) -> int:
     return 60
 
 # =====================================
-# PDF 자동 파싱 로직 (초정밀 스나이퍼 알고리즘)
+# 엑셀/CSV 데이터 초정밀 파싱 로직 
 # =====================================
-def parse_pension_pdf(file) -> dict:
-    """PDF의 표가 깨지는 현상을 방지하고, 정확히 '적용보수' 표만 타겟팅하여 추출"""
+def parse_pension_file(file) -> dict:
+    """CSV, XLS 파일에서 셀 구조의 장점을 활용해 데이터를 오차 없이 추출"""
     extracted_data = {}
     try:
-        reader = PyPDF2.PdfReader(file)
+        filename = file.name.lower()
         text = ""
-        for page in reader.pages:
-            text += page.extract_text() + " "
         
-        # 1. 임용일 추출 (연/월/일 다양한 포맷 대응)
+        # 1. 파일 텍스트화 (공단의 가짜 xls(HTML) 및 CSV 모두 커버하는 범용 디코딩)
+        try:
+            text = file.getvalue().decode('cp949') # 한국 공공기관 표준 인코딩
+        except UnicodeDecodeError:
+            try:
+                text = file.getvalue().decode('utf-8')
+            except Exception:
+                # 일반 엑셀 파일일 경우 Pandas로 읽어서 문자열로 변환
+                df = pd.read_excel(file)
+                text = df.to_string()
+
+        # 2. 정규식 추출 (셀 구분이 쉼표나 탭 등으로 나뉘어 있어 완벽한 매칭 가능)
+        
+        # 임용일 추출 (예: 2016-03-01, 2016/03/01, 2016.03.01)
         date_match = re.search(r'임용일.*?(\d{4})[./-](\d{2})[./-](\d{2})', text)
         if date_match:
             extracted_data['entry_date'] = date(int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3)))
             
-        # 2. 텍스트 공백을 모두 제거하여 띄어쓰기 오차 원천 차단
-        clean_text = re.sub(r'\s+', '', text)
-        
-        # 3. '적용보수' 표부터 '퇴직급여 개산액' 표 이전까지만 정확히 잘라냄
-        start_idx = clean_text.find("적용보수")
-        end_idx = clean_text.find("퇴직급여개산액")
-        
-        if start_idx != -1:
-            # 만약 끝단어를 못 찾으면 넉넉히 1000자만 탐색
-            if end_idx == -1: end_idx = start_idx + 1000 
-            
-            snippet = clean_text[start_idx:end_idx]
-            
-            # 쉼표(,)가 포함된 금액 포맷만 모두 추출
-            amounts = re.findall(r'\d{1,3}(?:,\d{3})+', snippet)
-            
-            # 100만 원 ~ 2,000만 원 사이의 상식적인 '기준소득월액'만 필터링
-            valid_nums = [int(a.replace(',', '')) for a in amounts if 1000000 <= int(a.replace(',', '')) <= 20000000]
-            
-            # 공단 서류의 표 구조상 마지막 2개의 금액이 무조건 'B값'과 '소득재분배값'임
-            if len(valid_nums) >= 2:
-                extracted_data['b_value'] = valid_nums[-2]
-                extracted_data['redist_value'] = valid_nums[-1]
+        # 개인 평균 기준소득월액 (글자 이후 처음 등장하는 6자리 이상 금액)
+        b_match = re.search(r'개인\s*평균\s*기준소득월액\D*?([\d,]{6,})', text)
+        if b_match:
+            val = int(b_match.group(1).replace(',', ''))
+            if 1000000 <= val <= 20000000:  # 비정상 데이터 방어
+                extracted_data['b_value'] = val
                 
+        # 소득재분배 반영 기준소득월액
+        redist_match = re.search(r'소득재분배\s*반영\D*?([\d,]{6,})', text)
+        if redist_match:
+            val = int(redist_match.group(1).replace(',', ''))
+            if 1000000 <= val <= 20000000:
+                extracted_data['redist_value'] = val
+                
+        # 2009년 이전 평균 보수월액 (해당자만 존재)
+        p1_match = re.search(r'2009년\s*이전.*?보수월액\D*?([\d,]{6,})', text)
+        if p1_match:
+            val = int(p1_match.group(1).replace(',', ''))
+            if 1000000 <= val <= 20000000:
+                extracted_data['p1_value'] = val
+
     except Exception as e:
-        st.error(f"PDF 분석 오류: {e}")
+        st.error(f"파일을 분석하는 중 오류가 발생했습니다: {e}")
         
     return extracted_data
 
@@ -283,17 +290,18 @@ def calculate_pension(inputs: Inputs) -> Result:
     )
 
 # =====================================
-# 세션 상태 초기화
+# 세션 상태 초기화 
 # =====================================
-if "pdf_entry_date" not in st.session_state: st.session_state.pdf_entry_date = None
-if "pdf_b_value" not in st.session_state: st.session_state.pdf_b_value = None
-if "pdf_redist_value" not in st.session_state: st.session_state.pdf_redist_value = None
+if "doc_entry_date" not in st.session_state: st.session_state.doc_entry_date = None
+if "doc_b_value" not in st.session_state: st.session_state.doc_b_value = None
+if "doc_redist_value" not in st.session_state: st.session_state.doc_redist_value = None
+if "doc_p1_value" not in st.session_state: st.session_state.doc_p1_value = None
 
 # =====================================
 # 화면 구성 (UI)
 # =====================================
 st.title("🏛️ 공무원연금 시뮬레이터 (추정/서류기반 정밀모드)")
-st.markdown("본인의 데이터를 직접 입력하거나 **예상퇴직급여내역서 PDF를 업로드**하여 정확도 높은 예상 연금액을 확인하세요.")
+st.markdown("본인의 데이터를 직접 입력하거나 **예상퇴직급여내역서 파일(CSV/엑셀)**을 업로드하여 정확도 높은 예상 연금액을 확인하세요.")
 
 with st.sidebar:
     st.header("1. 기본 정보")
@@ -301,7 +309,7 @@ with st.sidebar:
     
     current_contribution = st.number_input("현재 매월 납부하는 일반기여금 (원)", min_value=0, value=None, step=1000, placeholder="예: 396500")
     current_age = st.number_input("현재 나이 (세)", min_value=20, max_value=80, value=None, placeholder="예: 33")
-    entry_date = st.date_input("최초임용일", value=st.session_state.pdf_entry_date, min_value=date(1970, 1, 1), max_value=date(2100, 12, 31))
+    entry_date = st.date_input("최초임용일", value=st.session_state.doc_entry_date, min_value=date(1970, 1, 1), max_value=date(2100, 12, 31))
     
     retirement_date_input = st.date_input(
         "예상 퇴직일 (선택)", value=None, min_value=date(2000, 1, 1), max_value=date(2100, 12, 31), 
@@ -309,17 +317,19 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("2. 공단 서류 보정 (선택)")
+    st.header("2. 공단 서류 자동 입력 (선택)")
     
-    uploaded_file = st.file_uploader("📂 내 예상퇴직급여내역서 PDF 업로드", type=["pdf"], help="공단 홈페이지에서 다운받은 PDF를 올리면 숫자가 자동 입력됩니다.")
+    # 💡 파일 업로더 확장자 변경 (CSV, XLS, XLSX)
+    uploaded_file = st.file_uploader("📂 예상퇴직급여내역서 엑셀/CSV 파일 업로드", type=["csv", "xls", "xlsx"], help="공단 홈페이지에서 다운받은 파일을 올리면 수치가 자동 입력됩니다.")
     
     if uploaded_file is not None:
-        extracted = parse_pension_pdf(uploaded_file)
+        extracted = parse_pension_file(uploaded_file)
         if extracted:
             st.success("✅ 파일 분석 성공! 데이터를 아래 입력칸에 자동으로 채웠습니다.")
-            st.session_state.pdf_entry_date = extracted.get('entry_date', st.session_state.pdf_entry_date)
-            st.session_state.pdf_b_value = extracted.get('b_value', st.session_state.pdf_b_value)
-            st.session_state.pdf_redist_value = extracted.get('redist_value', st.session_state.pdf_redist_value)
+            st.session_state.doc_entry_date = extracted.get('entry_date', st.session_state.doc_entry_date)
+            st.session_state.doc_b_value = extracted.get('b_value', st.session_state.doc_b_value)
+            st.session_state.doc_redist_value = extracted.get('redist_value', st.session_state.doc_redist_value)
+            st.session_state.doc_p1_value = extracted.get('p1_value', st.session_state.doc_p1_value)
         else:
             st.error("❌ 파일에서 필요 데이터를 찾지 못했습니다. 직접 입력해주세요.")
             
@@ -327,9 +337,9 @@ with st.sidebar:
     exact_b_value, exact_redist_value, exact_p1_value = 0.0, 0.0, 0.0
 
     if use_exact_data:
-        exact_b_value = st.number_input("개인 평균 기준소득월액 (B값)", min_value=0, max_value=30000000, value=st.session_state.pdf_b_value, step=10000, placeholder="예: 3807467")
-        exact_redist_value = st.number_input("소득재분배 반영 기준소득월액", min_value=0, max_value=30000000, value=st.session_state.pdf_redist_value, step=10000, placeholder="예: 5076495")
-        exact_p1_value = st.number_input("2009년 이전 평균 보수월액 (선택)", min_value=0, max_value=30000000, value=None, step=10000, placeholder="해당 없으면 비워두세요.")
+        exact_b_value = st.number_input("개인 평균 기준소득월액 (B값)", min_value=0, max_value=30000000, value=st.session_state.doc_b_value, step=10000, placeholder="예: 3807467")
+        exact_redist_value = st.number_input("소득재분배 반영 기준소득월액", min_value=0, max_value=30000000, value=st.session_state.doc_redist_value, step=10000, placeholder="예: 5076495")
+        exact_p1_value = st.number_input("2009년 이전 평균 보수월액 (선택)", min_value=0, max_value=30000000, value=st.session_state.doc_p1_value, step=10000, placeholder="해당 없으면 비워두세요.")
 
     st.divider()
     with st.expander("경제 지표 가정"):

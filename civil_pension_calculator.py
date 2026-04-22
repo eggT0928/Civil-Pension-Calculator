@@ -148,24 +148,28 @@ def get_pension_start_age(entry_date: date, retirement_year: int) -> int:
     return 60
 
 # =====================================
-# 궁극의 파일 파서 (진공 압축 스나이핑)
+# 엑셀/CSV 데이터 초정밀 파싱 로직 (다중 시트 완벽 스나이핑)
 # =====================================
 def parse_pension_file(file) -> dict:
-    """CSV, XLS의 NaN이나 줄바꿈을 모두 무시하고 숫자만 정확히 낚아채는 무적 파서"""
+    """엑셀의 다중 시트(Sheet) 문제와 표 빈칸(NaN, 콤마) 찌꺼기를 완벽히 해결한 파서"""
     extracted_data = {}
     try:
+        file.seek(0) # 스트림릿 파일 포인터 초기화
         filename = file.name.lower()
         text = ""
         
-        # 1. 파일 읽기 (엑셀 엔진 또는 텍스트 디코딩)
+        # 1. 진짜 엑셀(.xls, .xlsx)인 경우 숨겨진 시트(Sheet)까지 모조리 합침
         if filename.endswith(('.xls', '.xlsx')):
             try:
-                df = pd.read_excel(file)
-                text = df.to_string()
+                # sheet_name=None 옵션이 핵심! (Page 2, Page 3까지 모두 스캔)
+                dfs = pd.read_excel(file, sheet_name=None)
+                text = " ".join([df.to_string() for df in dfs.values()])
             except Exception:
                 pass
-                
+        
+        # 2. 엑셀 파싱 실패 시(또는 CSV인 경우) 텍스트 강제 디코딩
         if not text:
+            file.seek(0)
             raw_bytes = file.getvalue()
             for encoding in ['utf-8', 'euc-kr', 'cp949']:
                 try:
@@ -173,38 +177,46 @@ def parse_pension_file(file) -> dict:
                     break
                 except UnicodeDecodeError:
                     continue
+                    
+        # HTML 찌꺼기 및 따옴표 제거 후 한 줄로 펼치기
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = text.replace('"', ' ').replace("'", " ").replace('\n', ' ')
 
-        # 2. 방해물 제거 및 진공 압축 (모든 줄바꿈, 띄어쓰기, 탭 삭제)
-        text = re.sub(r'<[^>]+>', ' ', text) # HTML 태그 제거
-        text = text.replace('"', '').replace("'", "") # 따옴표 제거
-        clean_text = re.sub(r'\s+', '', text) # 핵심: 모든 공백 완벽 압축
-        
-        # 3. 데이터 스나이핑 (정규식)
-        # 임용일: '임용일' 뒤에 오는 연/월/일
-        date_match = re.search(r'임용일.*?(\d{4})[./-년](\d{1,2})[./-월](\d{1,2})', clean_text)
-        if date_match:
-            extracted_data['entry_date'] = date(int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3)))
+        # 3. 데이터 정밀 타격 함수 (단어 발견 후 200자 이내의 유효한 값만 픽업)
+        def extract_value(keyword, is_date=False):
+            match = re.search(keyword, text)
+            if not match: return None
             
-        # 개인 평균 기준소득월액 (100만원~3000만원 사이 값만 필터링)
-        b_match = re.search(r'개인평균(?:기준소득월액)?.*?([1-9]\d{0,2}(?:,\d{3})+|[1-9]\d{5,})', clean_text)
-        if b_match:
-            val = int(b_match.group(1).replace(',', ''))
-            if 1000000 <= val <= 30000000:
-                extracted_data['b_value'] = val
-                
-        # 소득재분배 반영 기준소득월액
-        redist_match = re.search(r'소득재분배(?:반영|적용)?(?:기준소득월액)?.*?([1-9]\d{0,2}(?:,\d{3})+|[1-9]\d{5,})', clean_text)
-        if redist_match:
-            val = int(redist_match.group(1).replace(',', ''))
-            if 1000000 <= val <= 30000000:
-                extracted_data['redist_value'] = val
-                
-        # 2009년 이전 보수월액 (해당자만)
-        p1_match = re.search(r'2009년이전.*?보수월액.*?([1-9]\d{0,2}(?:,\d{3})+|[1-9]\d{5,})', clean_text)
-        if p1_match:
-            val = int(p1_match.group(1).replace(',', ''))
-            if 1000000 <= val <= 30000000:
-                extracted_data['p1_value'] = val
+            # 키워드 발견 지점부터 200자 이내의 텍스트만 스캔 (안전성 극대화)
+            snippet = text[match.end():match.end()+200]
+            
+            if is_date:
+                # yyyy-mm-dd, yyyy/mm/dd, yyyy.mm.dd 포맷 탐색
+                d_match = re.search(r'(\d{4})\s*[./-년]\s*(\d{1,2})\s*[./-월]\s*(\d{1,2})', snippet)
+                if d_match:
+                    return date(int(d_match.group(1)), int(d_match.group(2)), int(d_match.group(3)))
+            else:
+                # 금액 포맷 탐색 (콤마 유무 상관없이 추출)
+                amounts = re.findall(r'[1-9]\d{0,2}(?:,\d{3})+|[1-9]\d{5,}', snippet)
+                for amt in amounts:
+                    val = int(amt.replace(',', ''))
+                    # 100만원 이상 3000만원 이하의 상식적인 소득액만 픽업 (0이나 단순 페이지 번호 무시)
+                    if 1000000 <= val <= 30000000:
+                        return val
+            return None
+
+        # 값 추출 실행
+        entry_date = extract_value(r'임용일', is_date=True)
+        if entry_date: extracted_data['entry_date'] = entry_date
+        
+        b_val = extract_value(r'개인\s*평균\s*기준소득월액')
+        if b_val: extracted_data['b_value'] = b_val
+        
+        redist_val = extract_value(r'소득재분배\s*반영')
+        if redist_val: extracted_data['redist_value'] = redist_val
+        
+        p1_val = extract_value(r'2009년\s*이전.*?보수월액')
+        if p1_val: extracted_data['p1_value'] = p1_val
 
     except Exception as e:
         st.error(f"파일을 분석하는 중 오류가 발생했습니다: {e}")

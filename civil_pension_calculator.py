@@ -9,7 +9,7 @@ import streamlit as st
 # 기본 설정
 # =====================================
 st.set_page_config(
-    page_title="공무원연금 시뮬레이터 v2",
+    page_title="공무원연금 시뮬레이터 v3",
     page_icon="🏛️",
     layout="wide",
 )
@@ -71,9 +71,45 @@ OFFICIAL_A_VALUES: Dict[int, int] = {
     2026: 5710000,
 }
 
-# 2016년 이후 신규 임용자가 36년을 채우는 사례에서 자주 인용되는 재직기간별 적용비율 예시
-# 공단 실제 개인별 이행률/적용비율은 예상퇴직급여 상세자료에서 확인하는 것이 가장 정확함
-DEFAULT_FULL_36_TRANSITION_RATIO = 1.0344  # 103.44%
+# 2010년 이후 신규 임용자 기준 재직기간별 적용비율(이행률) 표
+# 단위: 배율. 예: 1.0344 = 103.44%
+# 주의: 이 표는 2009년 이전 종전기간이 없는 신규 임용자 기준으로 사용한다.
+# 2009년 이전 또는 2010~2015년 재직기간이 있는 장기 재직자는 공단 공식 예상액 확인이 필요하다.
+NEW_ENTRANT_TRANSITION_RATIO_BY_AFTER_YEARS: Dict[int, float] = {
+    0: 0.7725,
+    1: 0.7803,
+    2: 0.7835,
+    3: 0.7891,
+    4: 0.7956,
+    5: 0.8006,
+    6: 0.8072,
+    7: 0.8132,
+    8: 0.8175,
+    9: 0.8245,
+    10: 0.8289,
+    11: 0.8370,
+    12: 0.8462,
+    13: 0.8565,
+    14: 0.8670,
+    15: 0.8789,
+    16: 0.8900,
+    17: 0.9025,
+    18: 0.9142,
+    19: 0.9252,
+    20: 0.9286,
+    21: 0.9330,
+    22: 0.9381,
+    23: 0.9453,
+    24: 0.9533,
+    25: 0.9607,
+    26: 0.9702,
+    27: 0.9790,
+    28: 0.9899,
+    29: 1.0000,
+    30: 1.0109,
+    31: 1.0223,
+    32: 1.0344,
+}
 
 GEPS_HOME_URL = "https://www.geps.or.kr/index"
 GEPS_ESTIMATE_GUIDE_TEXT = "공무원연금공단 홈페이지 → 연금복지포털 → 로그인 → 나의 연금예상액 → 상세보기"
@@ -95,7 +131,6 @@ class Inputs:
     exact_b_value: float
     exact_redist_value: float
     exact_p1_value: float
-    exact_transition_ratio_pct: float
     job_type: str
 
 
@@ -321,16 +356,40 @@ def estimate_b_and_redist(current_standard_income: float, current_a_value: float
     return capped_b, est_redist
 
 
-def estimate_transition_ratio(post_2010_years: float, cap_years: int) -> float:
-    """재직기간별 적용비율(이행률) 자동 추정.
+def lookup_transition_ratio_new_entrant(post_2010_years: float) -> float:
+    """2010년 이후 신규 임용자 기준 재직기간별 적용비율(이행률)을 표에서 조회한다.
 
-    2016년 이후 36년 재직 시 103.44% 사례를 기준으로 선형 보간한다.
-    개인별 실제 이행률은 공단 상세자료 입력을 권장한다.
+    법령표는 연 단위 구간으로 제시되므로, 소수점 재직기간은 내림하여 조회한다.
+    32년 이상은 103.44%로 고정한다.
     """
     if post_2010_years <= 0:
-        return 1.0
-    effective_years = min(post_2010_years, float(cap_years), 36.0)
-    return 1.0 + (DEFAULT_FULL_36_TRANSITION_RATIO - 1.0) * (effective_years / 36.0)
+        return NEW_ENTRANT_TRANSITION_RATIO_BY_AFTER_YEARS[0]
+
+    years = int(post_2010_years)
+    if years < 0:
+        years = 0
+    if years >= 32:
+        years = 32
+
+    return NEW_ENTRANT_TRANSITION_RATIO_BY_AFTER_YEARS[years]
+
+
+def get_transition_ratio(service: dict) -> Tuple[float, str]:
+    """재직기간별 적용비율(이행률)을 자동 적용한다.
+
+    기본 타깃은 2010년 이후 신규 임용자다.
+    2009년 이전 또는 2010~2015년 재직기간이 있는 경우에는 신규자표가 정확하지 않을 수 있으므로
+    안내 문구를 결과 화면에 표시한다.
+    """
+    post_2010_years = service["y2"] + service["y3"]
+    ratio = lookup_transition_ratio_new_entrant(post_2010_years)
+
+    if service["pre_2016_service_years"] <= 0:
+        source = "법령표 자동 적용: 2010년 이후 신규자"
+    else:
+        source = "신규자표 임시 적용: 2016년 이전 재직자는 공단 공식값 확인 권장"
+
+    return ratio, source
 
 
 def retirement_allowance_rate(total_years: float) -> float:
@@ -405,13 +464,7 @@ def calculate_pension(inputs: Inputs) -> Result:
     actual_b_value = inputs.exact_b_value if (inputs.use_exact_data and inputs.exact_b_value > 0) else inferred_b_value
     actual_redist_value = inputs.exact_redist_value if (inputs.use_exact_data and inputs.exact_redist_value > 0) else inferred_redist_value
 
-    post_2010_years = service["y2"] + service["y3"]
-    if inputs.exact_transition_ratio_pct > 0:
-        transition_ratio = inputs.exact_transition_ratio_pct / 100
-        transition_ratio_source = "직접 입력"
-    else:
-        transition_ratio = estimate_transition_ratio(post_2010_years, service["cap_years"])
-        transition_ratio_source = "자동 추정"
+    transition_ratio, transition_ratio_source = get_transition_ratio(service)
 
     # 1기간: 2009.12.31 이전
     period1_monthly = 0.0
@@ -541,7 +594,6 @@ def get_missing_exact_fields(
     exact_b_value: float,
     exact_redist_value: float,
     exact_p1_value: float,
-    exact_transition_ratio_pct: float,
 ):
     missing = []
 
@@ -549,8 +601,6 @@ def get_missing_exact_fields(
         missing.append("개인 평균 기준소득월액(B값)")
     if exact_redist_value <= 0:
         missing.append("소득재분배 반영 기준소득월액")
-    if exact_transition_ratio_pct <= 0:
-        missing.append("재직기간별 적용비율(이행률)")
     if entry_date <= date(2009, 12, 31) and exact_p1_value <= 0:
         missing.append("2009년 이전 평균 보수월액")
 
@@ -562,16 +612,15 @@ def render_exact_input_guide(
     exact_b_value: float,
     exact_redist_value: float,
     exact_p1_value: float,
-    exact_transition_ratio_pct: float,
 ):
-    missing = get_missing_exact_fields(entry_date, exact_b_value, exact_redist_value, exact_p1_value, exact_transition_ratio_pct)
+    missing = get_missing_exact_fields(entry_date, exact_b_value, exact_redist_value, exact_p1_value)
     if not missing:
         return
 
     st.divider()
     st.subheader("🧭 적용보수 값 입력 가이드")
     st.info(
-        "`적용보수 값 사용`을 켠 상태입니다. 공단 예상퇴직급여 상세자료를 보고 숫자를 직접 입력하면 "
+        "`적용보수 값 사용`을 켠 상태입니다. 공단 예상퇴직급여 상세자료를 보고 적용보수 값을 직접 입력하면 "
         "기여금 역산 추정보다 계산 신뢰도가 올라갑니다. 필요한 값이 모두 입력되면 이 안내는 자동으로 사라집니다."
     )
 
@@ -585,7 +634,6 @@ def render_exact_input_guide(
 
 - **개인 평균 기준소득월액(B값)**
 - **소득재분배 반영 기준소득월액**
-- **재직기간별 적용비율(이행률, %)**
 - **2009년 이전 평균 보수월액** (해당자만)
 
 쉼표는 빼고 숫자만 넣어도 됩니다.
@@ -615,17 +663,14 @@ def render_exact_input_guide(
             "입력칸": [
                 "개인 평균 기준소득월액(B값)",
                 "소득재분배 반영 기준소득월액",
-                "재직기간별 적용비율(이행률)",
                 "2009년 이전 평균 보수월액",
             ],
             "서류에서 찾는 항목": [
                 "적용보수 표의 개인 평균 기준소득월액",
                 "2016년 이후 소득재분배 반영 평균 기준소득월액",
-                "재직기간별 적용비율 또는 이행률(%)",
                 "2009.12.31 이전 재직기간이 있는 경우 해당 구간 평균 보수월액",
             ],
             "입력 필요 여부": [
-                "권장",
                 "권장",
                 "권장",
                 "2009.12.31 이전 재직기간이 있을 때만 필요",
@@ -641,7 +686,7 @@ def render_exact_input_guide(
 # =====================================
 # UI
 # =====================================
-st.title("🏛️ 공무원연금 시뮬레이터 v2")
+st.title("🏛️ 공무원연금 시뮬레이터 v3")
 st.caption("공식 산정액이 아니라, 공무원연금 구조를 이해하기 위한 간이 시뮬레이터입니다.")
 
 st.warning(
@@ -701,10 +746,9 @@ with st.sidebar:
     exact_b_value = 0.0
     exact_redist_value = 0.0
     exact_p1_value = 0.0
-    exact_transition_ratio_pct = 0.0
 
     if use_exact_data:
-        st.caption("공단 예상퇴직급여 상세자료를 보고 숫자를 직접 입력합니다.")
+        st.caption("공단 예상퇴직급여 상세자료를 보고 적용보수 값을 직접 입력합니다. 이행률은 신규자표를 자동 적용합니다.")
 
         exact_b_value = st.number_input(
             "개인 평균 기준소득월액(B값)",
@@ -718,14 +762,6 @@ with st.sidebar:
             min_value=0,
             value=0,
             step=10000,
-        )
-
-        exact_transition_ratio_pct = st.number_input(
-            "재직기간별 적용비율 / 이행률 (%)",
-            min_value=0.0,
-            value=0.0,
-            step=0.01,
-            help="예: 103.44%라면 103.44를 입력합니다. 비워두면 자동 추정값을 사용합니다.",
         )
 
         exact_p1_value = st.number_input(
@@ -762,7 +798,7 @@ with st.sidebar:
 # 메인 가이드 표시
 # =====================================
 if use_exact_data:
-    render_exact_input_guide(entry_date, exact_b_value, exact_redist_value, exact_p1_value, exact_transition_ratio_pct)
+    render_exact_input_guide(entry_date, exact_b_value, exact_redist_value, exact_p1_value)
 
 
 # =====================================
@@ -780,7 +816,6 @@ inputs = Inputs(
     exact_b_value=float(exact_b_value or 0),
     exact_redist_value=float(exact_redist_value or 0),
     exact_p1_value=float(exact_p1_value or 0),
-    exact_transition_ratio_pct=float(exact_transition_ratio_pct or 0),
     job_type=job_type,
 )
 
@@ -940,15 +975,15 @@ with right:
 # 상태 메시지
 # =====================================
 if use_exact_data:
-    missing_exact = get_missing_exact_fields(entry_date, exact_b_value, exact_redist_value, exact_p1_value, exact_transition_ratio_pct)
+    missing_exact = get_missing_exact_fields(entry_date, exact_b_value, exact_redist_value, exact_p1_value)
     if missing_exact:
         st.warning(f"⚠️ 적용보수 직접입력 모드입니다. 아직 입력이 필요한 항목: {', '.join(missing_exact)}")
     else:
-        st.success("✅ 적용보수 입력이 완료되어 기여금 역산값보다 입력값을 우선 사용합니다.")
+        st.success("✅ 적용보수 입력이 완료되어 기여금 역산값보다 입력값을 우선 사용합니다. 이행률은 신규자표 기준으로 자동 적용됩니다.")
 else:
     st.info(
         "ℹ️ 현재는 기여금 기반 추정 모드입니다. 더 정확히 계산하려면 '적용보수 값 사용'을 켜고 "
-        "공단 예상퇴직급여 상세자료의 적용보수 값을 직접 입력하세요."
+        "공단 예상퇴직급여 상세자료의 적용보수 값을 직접 입력하세요. 이행률은 신규 임용자 기준 표로 자동 적용됩니다."
     )
 
 
@@ -982,14 +1017,15 @@ st.markdown(
 - 2016년 이후 구간을 단순히 `소득재분배값 × 연수 × 평균지급률`로 계산하지 않고,
   **① 소득재분배 1% 부분, ② 개인소득 지급률 초과분, ③ 30년 초과분**으로 나누었습니다.
 - 2010년 이후 구간에 **재직기간별 적용비율(이행률)** 을 반영했습니다.
-- 직접 입력값이 없을 때는 36년 재직 기준 103.44% 사례를 바탕으로 간단 추정합니다.
-- 더 정확한 계산을 원하면 공단 상세자료의 **B값, 소득재분배 반영값, 이행률** 을 직접 입력하세요.
+- 재직기간별 적용비율(이행률)은 선형보간하지 않고, **2010년 이후 신규 임용자 기준 하드코딩 표**에서 자동 조회합니다.
+- 2009년 이전 또는 2010~2015년 재직기간이 있는 사용자는 신규자표만으로 정확하지 않을 수 있으므로 공단 공식 예상액 확인이 필요합니다.
+- 더 정확한 계산을 원하면 공단 상세자료의 **B값, 소득재분배 반영값** 을 직접 입력하세요.
 
 ### 용어 정리
 
 - **B값**: 개인 평균 기준소득월액입니다.
 - **소득재분배 반영 기준소득월액**: 2016년 이후 구간의 1% 부분에 들어가는 보정 기준소득입니다.
-- **이행률 / 재직기간별 적용비율**: 2010년 이후 기준소득월액 산식에 반영되는 경과규정 성격의 비율입니다.
+- **이행률 / 재직기간별 적용비율**: 2010년 이후 기준소득월액 산식에 반영되는 경과규정 성격의 비율입니다. 이 앱은 2010년 이후 신규 임용자 기준 표를 자동 적용합니다.
 - **현재 기여금 기반 추정모드**: `현재 기여금 ÷ 9%`로 현재 기준소득월액을 역산한 뒤 추정합니다.
 - **적용보수 직접입력 모드**: 사용자가 직접 넣은 공단 상세자료 수치를 우선 사용합니다.
 """

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Dict, Tuple
+import re
 
 import pandas as pd
 import streamlit as st
@@ -9,7 +10,7 @@ import streamlit as st
 # 기본 설정
 # =====================================
 st.set_page_config(
-    page_title="공무원연금 시뮬레이터 v3",
+    page_title="공무원연금 시뮬레이터 v3.1",
     page_icon="🏛️",
     layout="wide",
 )
@@ -24,6 +25,12 @@ CONTRIBUTION_RATE = 0.09
 DEFAULT_SALARY_GROWTH = 0.025
 DEFAULT_INFLATION = 0.020
 DEFAULT_PERIOD2_RATE = 0.019
+
+# 입력칸을 비워두었을 때 사용할 예시 기준값
+# 화면에는 기본값을 직접 채우지 않고, placeholder로만 보여준다.
+FALLBACK_CURRENT_AGE = 33
+FALLBACK_ENTRY_DATE = date(2016, 3, 1)
+FALLBACK_CURRENT_CONTRIBUTION = 395000
 
 # 공무원연금 지급률: 2016~2035년 단계적 인하
 # 단위: %
@@ -637,8 +644,7 @@ def render_exact_input_guide(
 - **2009년 이전 평균 보수월액** (해당자만)
 
 쉼표는 빼고 숫자만 넣어도 됩니다.
-예: `3,807,467` → `3807467`  
-예: `103.44%` → `103.44`
+예: `3,807,467` → `3807467`
             """
         )
 
@@ -684,9 +690,79 @@ def render_exact_input_guide(
 
 
 # =====================================
+# 사용자 입력 파싱 유틸
+# =====================================
+def parse_int_text(raw_value: str, fallback: int, field_name: str, min_value: int | None = None, max_value: int | None = None) -> int:
+    """빈칸이면 fallback을 사용하고, 숫자가 아니면 경고 후 fallback을 사용한다."""
+    text = str(raw_value or "").strip()
+    if text == "":
+        return fallback
+
+    cleaned = re.sub(r"[^0-9-]", "", text)
+    if cleaned in ("", "-"):
+        st.sidebar.warning(f"'{field_name}' 입력값을 숫자로 읽을 수 없어 예시값({fallback:,})으로 계산합니다.")
+        return fallback
+
+    try:
+        value = int(cleaned)
+    except ValueError:
+        st.sidebar.warning(f"'{field_name}' 입력값을 숫자로 읽을 수 없어 예시값({fallback:,})으로 계산합니다.")
+        return fallback
+
+    if min_value is not None and value < min_value:
+        st.sidebar.warning(f"'{field_name}'은(는) {min_value:,} 이상이어야 해서 예시값({fallback:,})으로 계산합니다.")
+        return fallback
+    if max_value is not None and value > max_value:
+        st.sidebar.warning(f"'{field_name}'은(는) {max_value:,} 이하이어야 해서 예시값({fallback:,})으로 계산합니다.")
+        return fallback
+
+    return value
+
+
+def parse_date_text(raw_value: str, fallback: date, field_name: str) -> date:
+    """YYYY-MM-DD, YYYY.MM.DD, YYYY/MM/DD, '2016년 3월 1일' 형식을 날짜로 읽는다.
+
+    월까지만 입력한 경우에는 1일로 처리한다.
+    빈칸이거나 잘못된 값이면 fallback을 사용한다.
+    """
+    text = str(raw_value or "").strip()
+    if text == "":
+        return fallback
+
+    nums = re.findall(r"\d+", text)
+    try:
+        if len(nums) >= 3:
+            y, m, d = int(nums[0]), int(nums[1]), int(nums[2])
+        elif len(nums) == 2:
+            y, m, d = int(nums[0]), int(nums[1]), 1
+        else:
+            raise ValueError
+        return date(y, m, d)
+    except Exception:
+        st.sidebar.warning(
+            f"'{field_name}' 입력값을 날짜로 읽을 수 없어 예시값({fallback.strftime('%Y-%m-%d')})으로 계산합니다."
+        )
+        return fallback
+
+
+def render_fallback_notice(current_contribution_raw: str, current_age_raw: str, entry_date_raw: str) -> None:
+    """사용자가 비워둔 필드가 있으면 어떤 예시값이 적용되는지 간단히 알려준다."""
+    used = []
+    if not str(current_contribution_raw or "").strip():
+        used.append(f"일반기여금 {FALLBACK_CURRENT_CONTRIBUTION:,}원")
+    if not str(current_age_raw or "").strip():
+        used.append(f"현재 나이 {FALLBACK_CURRENT_AGE}세")
+    if not str(entry_date_raw or "").strip():
+        used.append(f"최초임용일 {FALLBACK_ENTRY_DATE.strftime('%Y-%m-%d')}")
+
+    if used:
+        st.sidebar.caption("미입력 항목은 예시값 기준으로 계산합니다: " + " / ".join(used))
+
+
+# =====================================
 # UI
 # =====================================
-st.title("🏛️ 공무원연금 시뮬레이터 v3")
+st.title("🏛️ 공무원연금 시뮬레이터 v3.1")
 st.caption("공식 산정액이 아니라, 공무원연금 구조를 이해하기 위한 간이 시뮬레이터입니다.")
 
 st.warning(
@@ -703,28 +779,49 @@ with st.sidebar:
         index=1,
     )
 
-    current_contribution = st.number_input(
+    current_contribution_raw = st.text_input(
         "현재 매월 납부하는 일반기여금 (원)",
+        value="",
+        placeholder=f"예: {FALLBACK_CURRENT_CONTRIBUTION:,}",
+        help=(
+            "급여명세서의 일반기여금을 입력하세요. 쉼표를 넣어도 됩니다. "
+            f"비워두면 예시값 {FALLBACK_CURRENT_CONTRIBUTION:,}원으로 계산합니다."
+        ),
+    )
+    current_contribution = parse_int_text(
+        current_contribution_raw,
+        fallback=FALLBACK_CURRENT_CONTRIBUTION,
+        field_name="현재 매월 납부하는 일반기여금",
         min_value=0,
-        value=396500,
-        step=1000,
-        help="현재 급여명세서에 표시되는 일반기여금을 입력하세요. 기준소득월액을 역산하는 데 사용합니다.",
     )
 
-    current_age = st.number_input(
+    current_age_raw = st.text_input(
         "현재 나이 (세)",
+        value="",
+        placeholder=f"예: {FALLBACK_CURRENT_AGE}",
+        help=f"비워두면 예시값 {FALLBACK_CURRENT_AGE}세로 계산합니다.",
+    )
+    current_age = parse_int_text(
+        current_age_raw,
+        fallback=FALLBACK_CURRENT_AGE,
+        field_name="현재 나이",
         min_value=20,
         max_value=80,
-        value=33,
-        step=1,
     )
 
-    entry_date = st.date_input(
+    entry_date_raw = st.text_input(
         "최초임용일",
-        value=date(2016, 3, 1),
-        min_value=date(1970, 1, 1),
-        max_value=date(2100, 12, 31),
+        value="",
+        placeholder=f"예: {FALLBACK_ENTRY_DATE.strftime('%Y-%m-%d')}",
+        help="YYYY-MM-DD 형식 권장. 예: 2016-03-01 / 비워두면 예시값으로 계산합니다.",
     )
+    entry_date = parse_date_text(
+        entry_date_raw,
+        fallback=FALLBACK_ENTRY_DATE,
+        field_name="최초임용일",
+    )
+
+    render_fallback_notice(current_contribution_raw, current_age_raw, entry_date_raw)
 
     use_custom_retirement_date = st.toggle("예상 퇴직일 직접 입력", value=False)
 

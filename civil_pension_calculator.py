@@ -67,6 +67,7 @@ OFFICIAL_A_VALUES = {
 
 GEPS_HOME_URL = "https://www.geps.or.kr/index"
 GEPS_ESTIMATE_GUIDE_TEXT = "공무원연금공단 홈페이지 → 연금복지포털 → 로그인 → 나의 연금예상액 → 상세보기"
+
 BASE_DIR = Path(__file__).resolve().parent
 IMPLEMENTATION_TABLE_PATH = BASE_DIR / "implementation_factor_table.csv"
 
@@ -147,21 +148,51 @@ class Result:
 # 표 로딩 / 조회
 # =====================================
 @st.cache_data
-def load_implementation_table() -> pd.DataFrame:
-    if not IMPLEMENTATION_TABLE_PATH.exists():
-        return pd.DataFrame(
-            columns=[
-                "old_label", "old_min", "old_max",
-                "new_label", "new_min", "new_max",
-                "factor_pct", "factor_decimal",
-            ]
-        )
+def load_implementation_table(path_str: str, file_mtime: float) -> pd.DataFrame:
+    """
+    이행률표 CSV를 읽습니다.
 
-    df = pd.read_csv(IMPLEMENTATION_TABLE_PATH)
-    numeric_cols = ["old_min", "old_max", "new_min", "new_max", "factor_pct", "factor_decimal"]
+    필요 파일명:
+    - implementation_factor_table.csv
+
+    app.py와 같은 폴더에 두면 됩니다.
+    file_mtime은 Streamlit 캐시 갱신용입니다.
+    """
+    path = Path(path_str)
+
+    required_cols = [
+        "old_label",
+        "old_min",
+        "old_max",
+        "new_label",
+        "new_min",
+        "new_max",
+        "factor_pct",
+    ]
+
+    if not path.exists():
+        return pd.DataFrame(columns=required_cols)
+
+    try:
+        df = pd.read_csv(path, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        df = pd.read_csv(path, encoding="cp949")
+
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        st.error(f"이행률표 CSV에 필요한 컬럼이 없습니다: {', '.join(missing_cols)}")
+        return pd.DataFrame(columns=required_cols)
+
+    df["old_label"] = df["old_label"].astype(str).str.strip()
+    df["new_label"] = df["new_label"].astype(str).str.strip()
+
+    numeric_cols = ["old_min", "old_max", "new_min", "new_max", "factor_pct"]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna(subset=["factor_pct"])
+
+    df = df.dropna(subset=numeric_cols)
+
+    return df
 
 
 def find_implementation_factor_from_table(
@@ -186,17 +217,21 @@ def find_implementation_factor_from_table(
     # 33년 이상이면 표의 32~33년 구간으로 조회한다.
     lookup_after = min(max(after_2010_years, 0.0), 32.999999)
 
+    # 2010.1.1 이후 임용자는 신규자 열 적용
     if entry_date >= date(2010, 1, 1):
         candidates = table[
             (table["old_label"] == "신규자")
             & (table["new_min"] <= lookup_after)
             & (lookup_after < table["new_max"])
         ]
+
         if candidates.empty:
             return 1.0, "신규자열 조회 실패: 기본 100%"
+
         row = candidates.iloc[0]
         return float(row["factor_pct"]) / 100, f"이행률표 자동조회: 신규자 / {row['new_label']}"
 
+    # 2010년 이전 임용자는 종전기간 × 이후기간 조합으로 조회
     lookup_before = min(max(before_2010_years, 0.0), 32.999999)
 
     candidates = table[
@@ -257,6 +292,7 @@ def get_default_retirement_date(current_age: int, retirement_basis: str) -> date
 
     if "교원" in retirement_basis:
         return date(retire_year, 3, 1) - timedelta(days=1)
+
     return date(retire_year, 12, 31)
 
 
@@ -341,6 +377,7 @@ def get_pension_start_age(entry_date: date, retirement_year: int) -> int:
         if retirement_year <= 2032:
             return 64
         return 65
+
     return 60
 
 
@@ -676,7 +713,8 @@ def render_exact_input_guide(
 # =====================================
 # UI
 # =====================================
-implementation_table = load_implementation_table()
+file_mtime = IMPLEMENTATION_TABLE_PATH.stat().st_mtime if IMPLEMENTATION_TABLE_PATH.exists() else 0
+implementation_table = load_implementation_table(str(IMPLEMENTATION_TABLE_PATH), file_mtime)
 
 st.title("🏛️ 공무원연금 시뮬레이터")
 st.markdown(
@@ -686,7 +724,7 @@ st.markdown(
 
 if implementation_table.empty:
     st.error(
-        "`data/implementation_factor_table.csv` 파일을 찾지 못했습니다. "
+        "`implementation_factor_table.csv` 파일을 찾지 못했습니다. "
         "이행률은 기본 100%로 계산됩니다."
     )
 
@@ -1054,7 +1092,7 @@ st.markdown(
 - **B값**: 개인 평균 기준소득월액입니다.
 - **소득재분배 반영 기준소득월액**: 2016년 이후 구간 계산에 들어가는 보정된 기준 소득입니다.
 - **이행률**: 재직기간별 기준소득월액에 적용하는 비율입니다.
-- 이 버전은 `data/implementation_factor_table.csv`의 전체 이행률표를 읽어 자동 적용합니다.
+- 이 버전은 `implementation_factor_table.csv`의 전체 이행률표를 읽어 자동 적용합니다.
 - **현재 기여금 기반 추정모드**에서는 `현재 기여금 ÷ 9%`로 현재 기준소득월액을 역산한 뒤 추정합니다.
 - **적용보수 직접입력 모드**에서는 사용자가 직접 넣은 수치를 우선 사용합니다.
 """

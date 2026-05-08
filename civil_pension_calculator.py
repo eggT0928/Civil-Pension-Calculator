@@ -46,7 +46,6 @@ PENSION_RATES = {
     2035: 1.700,
 }
 
-# 참고용 과거 A값
 OFFICIAL_A_VALUES = {
     2011: 3950000,
     2012: 4150000,
@@ -66,7 +65,6 @@ OFFICIAL_A_VALUES = {
     2026: 5950000,
 }
 
-# 공무원 전체 기준소득월액 평균액 적용기간
 A_VALUE_PERIODS = [
     (date(2025, 5, 1), date(2026, 4, 30), 5710000),
     (date(2026, 5, 1), date(2027, 4, 30), 5950000),
@@ -141,9 +139,13 @@ class Result:
     period1_monthly: float
     period2_monthly: float
     period3_monthly: float
+
     period3_redistribution_monthly: float
     period3_personal_monthly: float
     period3_over30_monthly: float
+    period3_new_formula_monthly: float
+    period3_old_rule_cap_monthly: float
+    period3_applied_rule: str
 
     retirement_allowance_real: float
     retirement_allowance_nominal: float
@@ -156,15 +158,6 @@ class Result:
 # =====================================
 @st.cache_data
 def load_implementation_table(path_str: str, file_mtime: float) -> pd.DataFrame:
-    """
-    이행률표 CSV를 읽습니다.
-
-    필요 파일명:
-    - implementation_factor_table.csv
-
-    app.py와 같은 폴더에 두면 됩니다.
-    file_mtime은 Streamlit 캐시 갱신용입니다.
-    """
     path = Path(path_str)
 
     required_cols = [
@@ -207,22 +200,14 @@ def find_implementation_factor_from_table(
     after_2010_years: float,
     manual_implementation_factor_pct: Optional[float] = None,
 ) -> tuple[float, str]:
-    """
-    반환값:
-    - factor: 103.44%이면 1.0344
-    - source: 조회 방식 설명
-    """
     if manual_implementation_factor_pct is not None and manual_implementation_factor_pct > 0:
         return manual_implementation_factor_pct / 100, "수동 입력"
 
     if table.empty:
         return 1.0, "이행률표 파일 없음: 기본 100%"
 
-    # 33년 초과자는 33년에 해당하는 비율을 적용한다는 규정 취지에 맞춰
-    # 33년 이상이면 표의 32~33년 구간으로 조회한다.
     lookup_after = min(max(after_2010_years, 0.0), 32.999999)
 
-    # 2010.1.1 이후 임용자는 신규자 열 적용
     if entry_date >= date(2010, 1, 1):
         candidates = table[
             (table["old_label"] == "신규자")
@@ -236,7 +221,6 @@ def find_implementation_factor_from_table(
         row = candidates.iloc[0]
         return float(row["factor_pct"]) / 100, f"이행률표 자동조회: 신규자 / {row['new_label']}"
 
-    # 2010년 이전 임용자는 종전기간 × 이후기간 조합으로 조회
     lookup_before = min(max(before_2010_years, 0.0), 32.999999)
 
     candidates = table[
@@ -295,11 +279,9 @@ def get_current_a_value(target_date: date) -> int:
         if start <= target_date <= end:
             return value
 
-    # 테이블 범위를 벗어난 경우에는 가장 최신값을 사용
     if target_date > A_VALUE_PERIODS[-1][1]:
         return A_VALUE_PERIODS[-1][2]
 
-    # 과거 날짜는 연도 기준 참고값 사용
     return OFFICIAL_A_VALUES.get(target_date.year, 5710000)
 
 
@@ -414,7 +396,6 @@ def estimate_b_and_redist(current_standard_income: float, current_a_value: float
 # 연금 계산
 # =====================================
 def calculate_service_years(entry_date: date, retirement_date: date):
-    # 월 기준 계산
     p1_start = date(1970, 1, 1)
     p1_end = date(2009, 12, 31)
     p2_start = date(2010, 1, 1)
@@ -502,11 +483,14 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
     if service["y2"] > 0:
         period2_monthly = actual_b_value * implementation_factor * service["y2"] * inputs.period2_rate
 
-    # 3기간: 소득재분배 1% 부분 + 개인소득분 + 30년 초과분
+    # 3기간: 개정산식 계산 후 종전규정 비교액과 비교
     period3_monthly = 0.0
     period3_redistribution_monthly = 0.0
     period3_personal_monthly = 0.0
     period3_over30_monthly = 0.0
+    period3_new_formula_monthly = 0.0
+    period3_old_rule_cap_monthly = 0.0
+    period3_applied_rule = "3기간 없음"
     avg_rate_2016plus = 0.0
 
     if service["y3"] > 0:
@@ -521,6 +505,7 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
         avg_rate_under30 = weighted_average_rate(period3_start, period3_start + years_under_30)
         avg_rate_over30 = weighted_average_rate(period3_start + years_under_30, period3_end)
 
+        # 개정산식 1: 소득재분배 1% 부분
         period3_redistribution_monthly = (
             actual_p3_value
             * implementation_factor
@@ -528,6 +513,7 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
             * 0.01
         )
 
+        # 개정산식 2: 개인소득분
         period3_personal_monthly = (
             actual_b_value
             * implementation_factor
@@ -536,6 +522,7 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
             / 100
         )
 
+        # 개정산식 3: 30년 초과분
         period3_over30_monthly = (
             actual_b_value
             * implementation_factor
@@ -544,11 +531,28 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
             / 100
         )
 
-        period3_monthly = (
+        period3_new_formula_monthly = (
             period3_redistribution_monthly
             + period3_personal_monthly
             + period3_over30_monthly
         )
+
+        # 종전규정 비교액:
+        # 공단 계산 사례상 2016년 이후 기간도
+        # B값 × 이행률 × 2016년 이후 재직기간 × 1.9% 비교상한을 적용해야 과대계산을 막을 수 있음.
+        period3_old_rule_cap_monthly = (
+            actual_b_value
+            * implementation_factor
+            * service["y3"]
+            * inputs.period2_rate
+        )
+
+        if period3_old_rule_cap_monthly > 0 and period3_new_formula_monthly > period3_old_rule_cap_monthly:
+            period3_monthly = period3_old_rule_cap_monthly
+            period3_applied_rule = "종전규정 비교액 적용"
+        else:
+            period3_monthly = period3_new_formula_monthly
+            period3_applied_rule = "개정산식 적용"
 
     monthly_pension_today = period1_monthly + period2_monthly + period3_monthly
 
@@ -622,6 +626,9 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
         period3_redistribution_monthly=period3_redistribution_monthly,
         period3_personal_monthly=period3_personal_monthly,
         period3_over30_monthly=period3_over30_monthly,
+        period3_new_formula_monthly=period3_new_formula_monthly,
+        period3_old_rule_cap_monthly=period3_old_rule_cap_monthly,
+        period3_applied_rule=period3_applied_rule,
         retirement_allowance_real=retirement_allowance_real,
         retirement_allowance_nominal=retirement_allowance_nominal,
         pension_lump_sum_real=pension_lump_sum_real,
@@ -745,7 +752,7 @@ st.title("🏛️ 공무원연금 시뮬레이터")
 st.markdown(
     "왼쪽 사이드바에 **현재 일반기여금, 현재 나이, 최초임용일**을 입력하면 "
     "예상 공무원연금을 계산합니다. "
-    "이번 버전은 전체 이행률표 CSV를 읽어 자동 반영합니다."
+    "이번 버전은 전체 이행률표 CSV와 3기간 종전규정 비교상한을 반영합니다."
 )
 
 if implementation_table.empty:
@@ -771,7 +778,7 @@ with st.sidebar:
         min_value=0,
         value=None,
         step=1000,
-        placeholder="예: 396500",
+        placeholder="예: 436600",
         help="현재 실제로 내고 있는 일반기여금을 입력하세요.",
     )
 
@@ -832,7 +839,7 @@ with st.sidebar:
             min_value=0,
             value=None,
             step=10000,
-            placeholder="예: 3807467",
+            placeholder="예: 3948130",
         )
 
         exact_redist_value = st.number_input(
@@ -840,7 +847,7 @@ with st.sidebar:
             min_value=0,
             value=None,
             step=10000,
-            placeholder="예: 5076495",
+            placeholder="예: 5264041",
         )
 
         exact_p1_value = st.number_input(
@@ -867,7 +874,7 @@ with st.sidebar:
         )
 
         period2_rate_pct = st.number_input(
-            "2기간 지급률 (%)",
+            "2기간 지급률 / 종전규정 비교 지급률 (%)",
             value=DEFAULT_PERIOD2_RATE * 100,
             step=0.001,
         )
@@ -977,7 +984,8 @@ c4.metric(
 
 st.caption(
     f"적용 이행률: **{res.implementation_factor_pct:.2f}%** "
-    f"({res.implementation_factor_source})"
+    f"({res.implementation_factor_source}) / "
+    f"3기간 적용 방식: **{res.period3_applied_rule}**"
 )
 
 st.divider()
@@ -1032,6 +1040,7 @@ with left:
                 "재직기간 상한",
                 "적용 이행률",
                 "이행률 적용 방식",
+                "3기간 적용 방식",
                 "예상 퇴직연도",
                 "퇴직 시점 나이(추정)",
                 "2016년 이후 평균 지급률",
@@ -1048,6 +1057,7 @@ with left:
                 f"{res.service_cap_years}년",
                 f"{res.implementation_factor_pct:.2f}%",
                 res.implementation_factor_source,
+                res.period3_applied_rule,
                 f"{res.retirement_year}년",
                 f"{res.retirement_age_est:.1f}세",
                 pct(res.avg_rate_2016plus),
@@ -1083,14 +1093,22 @@ with right:
     detail_df = pd.DataFrame(
         {
             "3기간 세부": [
-                "소득재분배 1% 부분",
-                "개인소득분",
-                "30년 초과분",
+                "개정산식: 소득재분배 1% 부분",
+                "개정산식: 개인소득분",
+                "개정산식: 30년 초과분",
+                "개정산식 합계",
+                "종전규정 비교액",
+                "최종 적용액",
+                "적용 방식",
             ],
-            "월 연금 기여분": [
+            "값": [
                 won(res.period3_redistribution_monthly),
                 won(res.period3_personal_monthly),
                 won(res.period3_over30_monthly),
+                won(res.period3_new_formula_monthly),
+                won(res.period3_old_rule_cap_monthly),
+                won(res.period3_monthly),
+                res.period3_applied_rule,
             ],
         }
     )
@@ -1145,7 +1163,7 @@ formula_df = pd.DataFrame(
         "기본 계산방식": [
             "과거 경과규정 반영(간이식)",
             "B값 × 이행률 × 연수 × 지급률(기본 1.9%)",
-            "소득재분배 1% 부분 + 개인소득분 + 30년 초과분",
+            "개정산식 계산 후 종전규정 비교액과 비교하여 더 낮은 금액 적용",
         ],
     }
 )
@@ -1159,6 +1177,7 @@ st.markdown(
 - **B값**: 개인 평균 기준소득월액입니다.
 - **소득재분배 반영 기준소득월액**: 2016년 이후 구간 계산에 들어가는 보정된 기준 소득입니다.
 - **이행률**: 재직기간별 기준소득월액에 적용하는 비율입니다.
+- **3기간 보정**: 개정산식으로 계산한 금액이 종전규정 비교액보다 크면 종전규정 비교액을 적용합니다.
 - 이 버전은 `implementation_factor_table.csv`의 전체 이행률표를 읽어 자동 적용합니다.
 - **현재 기여금 기반 추정모드**에서는 `현재 기여금 ÷ 9%`로 현재 기준소득월액을 역산한 뒤 추정합니다.
 - **적용보수 직접입력 모드**에서는 사용자가 직접 넣은 수치를 우선 사용합니다.
@@ -1170,7 +1189,7 @@ st.markdown(
     """
 - 이 앱은 **공식 산정액이 아닌 추정용 시뮬레이터**입니다.
 - 파일 자동 읽기 기능은 제거하고, **직접 입력 방식으로 단순화**했습니다.
-- 이번 버전은 **전체 이행률표 CSV 자동 조회**를 반영했습니다.
+- 이번 버전은 **전체 이행률표 CSV 자동 조회**와 **3기간 종전규정 비교상한**을 반영했습니다.
 - 처음 접속 시 기본 개인정보 예시는 넣지 않았습니다.
 - `적용보수 값 사용`을 켜면 메인 화면에 **입력 가이드(말 설명 + 공식 사이트 안내)** 가 나타납니다.
 - 필요한 숫자를 모두 입력하면 가이드는 자동으로 사라집니다.

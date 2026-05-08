@@ -118,6 +118,7 @@ class Result:
     inferred_b_value: float
     inferred_redist_value: float
 
+    actual_total_service_years: float
     pre_2016_service_years: float
     before_2010_service_years: float
     after_2010_service_years: float
@@ -134,6 +135,7 @@ class Result:
     implementation_factor: float
     implementation_factor_pct: float
     implementation_factor_source: str
+    implementation_factor_lookup_years: float
 
     base_p1_income: float
     base_p2_income: float
@@ -213,17 +215,27 @@ def find_implementation_factor_from_table(
     entry_date: date,
     before_2010_years: float,
     after_2010_years: float,
+    actual_total_service_years: float,
     manual_implementation_factor_pct: Optional[float] = None,
-) -> tuple[float, str]:
+) -> tuple[float, str, float]:
+    """
+    이행률표 조회.
+
+    중요 수정:
+    - 2010.1.1 이후 임용자(신규자)는 월 단위 인정기간이 아니라
+      실제 날짜 기준 총 재직연수(actual_total_service_years)로 이행률 구간을 조회합니다.
+    - 공단 화면상 재직기간은 12년 0월처럼 표시되어도,
+      실제 날짜상 만 12년 미만이면 11년 이상~12년 미만 구간을 적용하는 케이스가 있습니다.
+    """
     if manual_implementation_factor_pct is not None and manual_implementation_factor_pct > 0:
-        return manual_implementation_factor_pct / 100, "수동 입력"
+        return manual_implementation_factor_pct / 100, "수동 입력", actual_total_service_years
 
     if table.empty:
-        return 1.0, "이행률표 파일 없음: 기본 100%"
-
-    lookup_after = min(max(after_2010_years, 0.0), 32.999999)
+        return 1.0, "이행률표 파일 없음: 기본 100%", actual_total_service_years
 
     if entry_date >= date(2010, 1, 1):
+        lookup_after = min(max(actual_total_service_years, 0.0), 32.999999)
+
         candidates = table[
             (table["old_label"] == "신규자")
             & (table["new_min"] <= lookup_after)
@@ -231,11 +243,16 @@ def find_implementation_factor_from_table(
         ]
 
         if candidates.empty:
-            return 1.0, "신규자열 조회 실패: 기본 100%"
+            return 1.0, "신규자열 조회 실패: 기본 100%", lookup_after
 
         row = candidates.iloc[0]
-        return float(row["factor_pct"]) / 100, f"이행률표 자동조회: 신규자 / {row['new_label']}"
+        return (
+            float(row["factor_pct"]) / 100,
+            f"이행률표 자동조회: 신규자 / {row['new_label']}",
+            lookup_after,
+        )
 
+    lookup_after = min(max(after_2010_years, 0.0), 32.999999)
     lookup_before = min(max(before_2010_years, 0.0), 32.999999)
 
     candidates = table[
@@ -247,10 +264,14 @@ def find_implementation_factor_from_table(
     ]
 
     if candidates.empty:
-        return 1.0, "전체 이행률표 조회 실패: 기본 100%"
+        return 1.0, "전체 이행률표 조회 실패: 기본 100%", lookup_after
 
     row = candidates.iloc[0]
-    return float(row["factor_pct"]) / 100, f"이행률표 자동조회: 종전 {row['old_label']} / 이후 {row['new_label']}"
+    return (
+        float(row["factor_pct"]) / 100,
+        f"이행률표 자동조회: 종전 {row['old_label']} / 이후 {row['new_label']}",
+        lookup_after,
+    )
 
 
 # =====================================
@@ -415,7 +436,6 @@ def split_allowance_service_years(
 ) -> tuple[float, float, float]:
     """
     퇴직수당 재직기간 감축개월을 최근 기간부터 차감합니다.
-    보통 가족돌봄휴직/간병휴직 등은 최근 기간에 있을 가능성이 높으므로
     3기간 → 2기간 → 1기간 순서로 차감합니다.
     """
     deduction_years = max(0, deduction_months) / 12
@@ -432,7 +452,7 @@ def split_allowance_service_years(
 
 
 # =====================================
-# 연금 계산
+# 재직기간 계산
 # =====================================
 def calculate_service_years(entry_date: date, retirement_date: date):
     p1_start = date(1970, 1, 1)
@@ -455,7 +475,10 @@ def calculate_service_years(entry_date: date, retirement_date: date):
 
     y1, y2, y3 = apply_service_cap(raw_y1, raw_y2, raw_y3, cap_years)
 
+    actual_total_service_years = years_between(entry_date, retirement_date)
+
     return {
+        "actual_total_service_years": actual_total_service_years,
         "raw_y1": raw_y1,
         "raw_y2": raw_y2,
         "raw_y3": raw_y3,
@@ -471,6 +494,9 @@ def calculate_service_years(entry_date: date, retirement_date: date):
     }
 
 
+# =====================================
+# 핵심 계산
+# =====================================
 def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Result:
     retirement_year = inputs.retirement_date.year
     years_to_retire = max(0.0, years_between(CURRENT_DATE, inputs.retirement_date))
@@ -521,11 +547,16 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
         else current_standard_income
     )
 
-    implementation_factor, implementation_factor_source = find_implementation_factor_from_table(
+    (
+        implementation_factor,
+        implementation_factor_source,
+        implementation_factor_lookup_years,
+    ) = find_implementation_factor_from_table(
         table=implementation_table,
         entry_date=inputs.entry_date,
         before_2010_years=service["before_2010_service_years"],
         after_2010_years=service["after_2010_service_years"],
+        actual_total_service_years=service["actual_total_service_years"],
         manual_implementation_factor_pct=inputs.manual_implementation_factor_pct,
     )
 
@@ -618,7 +649,7 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
     monthly_pension_nominal = monthly_pension_today * growth_factor
     monthly_pension_real = monthly_pension_nominal / inflation_factor
 
-    # 퇴직수당: 1기간과 2010년 이후기간을 분리 계산
+    # 퇴직수당: 1기간과 2010년 이후기간 분리 계산
     y1_allowance, y2_allowance, y3_allowance = split_allowance_service_years(
         service["y1"],
         service["y2"],
@@ -644,7 +675,7 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
     retirement_allowance_real = p1_retirement_allowance_real + post2010_retirement_allowance_real
     retirement_allowance_nominal = retirement_allowance_real * growth_factor
 
-    # 연금일시금: 1기간과 2010년 이후기간을 분리 계산
+    # 연금일시금: 1기간과 2010년 이후기간 분리 계산
     total_service_years = service["recognized_service_years"]
 
     p1_lump_multiplier = 1.5 + max(0.0, total_service_years - 5.0) * 0.01
@@ -680,6 +711,7 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
         current_a_value=current_a_value,
         inferred_b_value=inferred_b_value,
         inferred_redist_value=inferred_redist_value,
+        actual_total_service_years=service["actual_total_service_years"],
         pre_2016_service_years=service["pre_2016_service_years"],
         before_2010_service_years=service["before_2010_service_years"],
         after_2010_service_years=service["after_2010_service_years"],
@@ -694,6 +726,7 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
         implementation_factor=implementation_factor,
         implementation_factor_pct=implementation_factor * 100,
         implementation_factor_source=implementation_factor_source,
+        implementation_factor_lookup_years=implementation_factor_lookup_years,
         base_p1_income=actual_p1_pension_value if service["y1"] > 0 else 0.0,
         base_p2_income=actual_b_value if service["y2"] > 0 else 0.0,
         base_p3_income=actual_p3_value if service["y3"] > 0 else 0.0,
@@ -914,7 +947,7 @@ with st.sidebar:
             min_value=0,
             value=None,
             step=10000,
-            placeholder="예: 4974542",
+            placeholder="예: 4518107",
         )
 
         exact_redist_value = st.number_input(
@@ -922,7 +955,7 @@ with st.sidebar:
             min_value=0,
             value=None,
             step=10000,
-            placeholder="예: 5596359",
+            placeholder="예: 5486337",
         )
 
         exact_post2010_lump_allowance_value = st.number_input(
@@ -930,7 +963,7 @@ with st.sidebar:
             min_value=0,
             value=None,
             step=10000,
-            placeholder="예: 6672385",
+            placeholder="예: 5578769",
             help="적용보수 표에서 2010.1.1 이후기간 <Ⅱ·Ⅲ기간> 아래 '일시금' 또는 '퇴직수당' 칸 금액을 입력합니다.",
         )
 
@@ -939,7 +972,7 @@ with st.sidebar:
             min_value=0,
             value=None,
             step=10000,
-            placeholder="예: 1756625",
+            placeholder="해당 없으면 비워두기",
             help="적용보수 표에서 2009.12.31 이전기간 <Ⅰ기간> 아래 '연금' 칸 금액입니다. 해당 기간이 없으면 비워둡니다.",
         )
 
@@ -948,7 +981,7 @@ with st.sidebar:
             min_value=0,
             value=None,
             step=10000,
-            placeholder="예: 2084857",
+            placeholder="해당 없으면 비워두기",
             help="퇴직연금일시금 계산용입니다. 해당 기간이 없으면 비워둡니다.",
         )
 
@@ -957,7 +990,7 @@ with st.sidebar:
             min_value=0,
             value=None,
             step=10000,
-            placeholder="예: 2084857",
+            placeholder="해당 없으면 비워두기",
             help="퇴직수당 계산용입니다. 해당 기간이 없으면 비워둡니다.",
         )
 
@@ -1017,7 +1050,7 @@ with st.sidebar:
                 max_value=120.0,
                 value=100.0,
                 step=0.01,
-                help="예: 103.44를 입력하면 1.0344배로 계산합니다.",
+                help="예: 83.70을 입력하면 0.8370배로 계산합니다.",
             )
 
 
@@ -1112,7 +1145,7 @@ c4.metric(
 
 st.caption(
     f"적용 이행률: **{res.implementation_factor_pct:.2f}%** "
-    f"({res.implementation_factor_source}) / "
+    f"({res.implementation_factor_source}, 조회기준 {res.implementation_factor_lookup_years:.2f}년) / "
     f"3기간 적용 방식: **{res.period3_applied_rule}**"
 )
 
@@ -1161,11 +1194,13 @@ with left:
                 "전체 공무원 A값",
                 "추정 B값(적용보수 미입력 시)",
                 "추정 소득재분배 반영값(적용보수 미입력 시)",
+                "실제 날짜 기준 총 재직기간",
                 "2016.1.1 기준 재직기간",
                 "2010년 이전 인정 재직기간",
                 "2010년 이후 인정 재직기간",
                 "재직기간 상한",
                 "적용 이행률",
+                "이행률 조회 기준연수",
                 "이행률 적용 방식",
                 "3기간 적용 방식",
                 "퇴직수당 감축개월",
@@ -1181,11 +1216,13 @@ with left:
                 won(res.current_a_value),
                 won(res.inferred_b_value),
                 won(res.inferred_redist_value),
+                f"{res.actual_total_service_years:.2f}년",
                 f"{res.pre_2016_service_years:.2f}년",
                 f"{res.before_2010_service_years:.2f}년",
                 f"{res.after_2010_service_years:.2f}년",
                 f"{res.service_cap_years}년",
                 f"{res.implementation_factor_pct:.2f}%",
+                f"{res.implementation_factor_lookup_years:.2f}년",
                 res.implementation_factor_source,
                 res.period3_applied_rule,
                 f"{res.retirement_allowance_deduction_months}개월",
@@ -1313,18 +1350,20 @@ st.subheader("연금 계산 공식 설명")
 
 formula_df = pd.DataFrame(
     {
-        "구간": ["1기간", "2기간", "3기간", "일시금/퇴직수당"],
+        "구간": ["1기간", "2기간", "3기간", "일시금/퇴직수당", "이행률"],
         "의미": [
             "2009.12.31 이전 재직기간",
             "2010.1.1 ~ 2015.12.31 재직기간",
             "2016.1.1 이후 재직기간",
             "퇴직연금일시금 및 퇴직수당",
+            "재직기간별 기준소득월액 적용비율",
         ],
         "기본 계산방식": [
             "Ⅰ기간의 연금 칸 금액을 사용",
             "B값 × 이행률 × 연수 × 지급률(기본 1.9%)",
             "개정산식 계산 후 종전규정 비교액과 비교하여 더 낮은 금액 적용",
             "Ⅰ기간과 2010년 이후기간의 일시금/퇴직수당 적용보수를 분리 계산",
+            "2010년 이후 임용자는 실제 날짜 기준 총 재직연수로 신규자열 조회",
         ],
     }
 )
@@ -1341,6 +1380,7 @@ st.markdown(
 - **Ⅰ기간 일시금/퇴직수당 칸 금액**: 2009.12.31 이전기간의 연금일시금과 퇴직수당 계산에 사용합니다.
 - **Ⅱ·Ⅲ기간 일시금/퇴직수당 칸 금액**: 2010.1.1 이후기간의 연금일시금과 퇴직수당 계산에 사용합니다.
 - **이행률**: 재직기간별 기준소득월액에 적용하는 비율입니다.
+- **이행률 조회 보정**: 2010.1.1 이후 임용자는 월 단위 표시 재직기간이 아니라 실제 날짜 기준 총 재직연수로 신규자열을 조회합니다.
 - **3기간 보정**: 개정산식으로 계산한 금액이 종전규정 비교액보다 크면 종전규정 비교액을 적용합니다.
 - **퇴직수당 감축개월**: 공단 화면에서 퇴직급여 재직기간과 퇴직수당 재직기간이 다를 때 그 차이만큼 입력합니다.
 - 이 버전은 `implementation_factor_table.csv`의 전체 이행률표를 읽어 자동 적용합니다.
@@ -1352,7 +1392,7 @@ st.markdown(
     """
 - 이 앱은 **공식 산정액이 아닌 추정용 시뮬레이터**입니다.
 - 파일 자동 읽기 기능은 제거하고, **직접 입력 방식으로 단순화**했습니다.
-- 이번 버전은 **전체 이행률표 CSV 자동 조회**, **3기간 종전규정 비교상한**, **퇴직수당 재직기간 감축개월**, **일시금/퇴직수당 적용보수 분리 계산**을 반영했습니다.
+- 이번 버전은 **전체 이행률표 CSV 자동 조회**, **3기간 종전규정 비교상한**, **퇴직수당 재직기간 감축개월**, **일시금/퇴직수당 적용보수 분리 계산**, **신규자 이행률 조회기준 보정**을 반영했습니다.
 - 처음 접속 시 기본 개인정보 예시는 넣지 않았습니다.
 - `적용보수 값 사용`을 켜면 메인 화면에 입력 가이드가 나타납니다.
 - 실제 지급액은 공무원연금공단의 상세 이력, 경과규정, 실제 기준소득월액 데이터 등에 따라 달라질 수 있습니다.

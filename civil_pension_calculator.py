@@ -95,6 +95,7 @@ class Inputs:
     exact_p1_value: float
     retirement_basis: str
     manual_implementation_factor_pct: Optional[float]
+    retirement_allowance_deduction_months: int
 
 
 @dataclass
@@ -149,6 +150,10 @@ class Result:
 
     retirement_allowance_real: float
     retirement_allowance_nominal: float
+    retirement_allowance_service_years: float
+    retirement_allowance_deduction_months: int
+    retirement_allowance_rate_pct: float
+
     pension_lump_sum_real: float
     pension_lump_sum_nominal: float
 
@@ -206,6 +211,7 @@ def find_implementation_factor_from_table(
     if table.empty:
         return 1.0, "이행률표 파일 없음: 기본 100%"
 
+    # 33년 초과자는 33년에 해당하는 비율 적용 취지로 32~33년 구간 조회
     lookup_after = min(max(after_2010_years, 0.0), 32.999999)
 
     if entry_date >= date(2010, 1, 1):
@@ -505,7 +511,6 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
         avg_rate_under30 = weighted_average_rate(period3_start, period3_start + years_under_30)
         avg_rate_over30 = weighted_average_rate(period3_start + years_under_30, period3_end)
 
-        # 개정산식 1: 소득재분배 1% 부분
         period3_redistribution_monthly = (
             actual_p3_value
             * implementation_factor
@@ -513,7 +518,6 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
             * 0.01
         )
 
-        # 개정산식 2: 개인소득분
         period3_personal_monthly = (
             actual_b_value
             * implementation_factor
@@ -522,7 +526,6 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
             / 100
         )
 
-        # 개정산식 3: 30년 초과분
         period3_over30_monthly = (
             actual_b_value
             * implementation_factor
@@ -537,9 +540,6 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
             + period3_over30_monthly
         )
 
-        # 종전규정 비교액:
-        # 공단 계산 사례상 2016년 이후 기간도
-        # B값 × 이행률 × 2016년 이후 재직기간 × 1.9% 비교상한을 적용해야 과대계산을 막을 수 있음.
         period3_old_rule_cap_monthly = (
             actual_b_value
             * implementation_factor
@@ -559,14 +559,28 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
     monthly_pension_nominal = monthly_pension_today * ((1 + inputs.salary_growth) ** years_to_retire)
     monthly_pension_real = monthly_pension_nominal / ((1 + inputs.inflation) ** years_to_retire)
 
-    # 퇴직수당 간이 추정
-    projected_final_income_nominal = current_standard_income * ((1 + inputs.salary_growth) ** years_to_retire)
-    allowance_rate = retirement_allowance_rate(service["recognized_service_years"])
+    # 퇴직수당: 연금 인정 재직기간과 별도 계산
+    pension_service_months = int(round(service["recognized_service_years"] * 12))
+    deduction_months = max(0, int(inputs.retirement_allowance_deduction_months))
 
-    retirement_allowance_real = current_standard_income * service["recognized_service_years"] * allowance_rate
+    retirement_allowance_months = max(
+        0,
+        pension_service_months - deduction_months,
+    )
+    retirement_allowance_service_years = retirement_allowance_months / 12
+
+    allowance_rate = retirement_allowance_rate(retirement_allowance_service_years)
+
+    projected_final_income_nominal = current_standard_income * ((1 + inputs.salary_growth) ** years_to_retire)
+
+    retirement_allowance_real = (
+        current_standard_income
+        * retirement_allowance_service_years
+        * allowance_rate
+    )
     retirement_allowance_nominal = (
         projected_final_income_nominal
-        * service["recognized_service_years"]
+        * retirement_allowance_service_years
         * allowance_rate
     )
 
@@ -631,6 +645,9 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
         period3_applied_rule=period3_applied_rule,
         retirement_allowance_real=retirement_allowance_real,
         retirement_allowance_nominal=retirement_allowance_nominal,
+        retirement_allowance_service_years=retirement_allowance_service_years,
+        retirement_allowance_deduction_months=deduction_months,
+        retirement_allowance_rate_pct=allowance_rate * 100,
         pension_lump_sum_real=pension_lump_sum_real,
         pension_lump_sum_nominal=pension_lump_sum_nominal,
     )
@@ -752,7 +769,7 @@ st.title("🏛️ 공무원연금 시뮬레이터")
 st.markdown(
     "왼쪽 사이드바에 **현재 일반기여금, 현재 나이, 최초임용일**을 입력하면 "
     "예상 공무원연금을 계산합니다. "
-    "이번 버전은 전체 이행률표 CSV와 3기간 종전규정 비교상한을 반영합니다."
+    "이번 버전은 전체 이행률표 CSV, 3기간 종전규정 비교상한, 퇴직수당 재직기간 보정을 반영합니다."
 )
 
 if implementation_table.empty:
@@ -881,6 +898,24 @@ with st.sidebar:
 
         st.divider()
 
+        retirement_allowance_deduction_months = st.number_input(
+            "퇴직수당 재직기간 감축개월",
+            min_value=0,
+            value=0,
+            step=1,
+            help=(
+                "공단 예상퇴직급여 화면에서 퇴직급여 재직기간과 퇴직수당 재직기간이 다르면 "
+                "그 차이를 개월 수로 입력하세요. 예: 퇴직급여 10년3월, 퇴직수당 10년1월 → 2개월"
+            ),
+        )
+
+        st.caption(
+            "군복무휴직, 육아휴직처럼 일반적으로 퇴직수당에서 감축하지 않는 기간은 입력하지 않습니다. "
+            "공단 화면의 두 재직기간 차이를 입력하는 방식이 가장 안전합니다."
+        )
+
+        st.divider()
+
         use_manual_implementation_factor = st.toggle(
             "재직기간별 적용비율(이행률) 직접 입력",
             value=False,
@@ -951,6 +986,7 @@ inputs = Inputs(
     exact_p1_value=float(exact_p1_value or 0),
     retirement_basis=retirement_basis,
     manual_implementation_factor_pct=manual_implementation_factor_pct,
+    retirement_allowance_deduction_months=int(retirement_allowance_deduction_months),
 )
 
 res = calculate_pension(inputs, implementation_table)
@@ -1041,6 +1077,9 @@ with left:
                 "적용 이행률",
                 "이행률 적용 방식",
                 "3기간 적용 방식",
+                "퇴직수당 감축개월",
+                "퇴직수당 인정 재직기간",
+                "퇴직수당 지급비율",
                 "예상 퇴직연도",
                 "퇴직 시점 나이(추정)",
                 "2016년 이후 평균 지급률",
@@ -1058,6 +1097,9 @@ with left:
                 f"{res.implementation_factor_pct:.2f}%",
                 res.implementation_factor_source,
                 res.period3_applied_rule,
+                f"{res.retirement_allowance_deduction_months}개월",
+                f"{res.retirement_allowance_service_years:.2f}년",
+                f"{res.retirement_allowance_rate_pct:.2f}%",
                 f"{res.retirement_year}년",
                 f"{res.retirement_age_est:.1f}세",
                 pct(res.avg_rate_2016plus),
@@ -1178,6 +1220,7 @@ st.markdown(
 - **소득재분배 반영 기준소득월액**: 2016년 이후 구간 계산에 들어가는 보정된 기준 소득입니다.
 - **이행률**: 재직기간별 기준소득월액에 적용하는 비율입니다.
 - **3기간 보정**: 개정산식으로 계산한 금액이 종전규정 비교액보다 크면 종전규정 비교액을 적용합니다.
+- **퇴직수당 감축개월**: 공단 화면에서 퇴직급여 재직기간과 퇴직수당 재직기간이 다를 때 그 차이만큼 입력합니다.
 - 이 버전은 `implementation_factor_table.csv`의 전체 이행률표를 읽어 자동 적용합니다.
 - **현재 기여금 기반 추정모드**에서는 `현재 기여금 ÷ 9%`로 현재 기준소득월액을 역산한 뒤 추정합니다.
 - **적용보수 직접입력 모드**에서는 사용자가 직접 넣은 수치를 우선 사용합니다.
@@ -1189,7 +1232,7 @@ st.markdown(
     """
 - 이 앱은 **공식 산정액이 아닌 추정용 시뮬레이터**입니다.
 - 파일 자동 읽기 기능은 제거하고, **직접 입력 방식으로 단순화**했습니다.
-- 이번 버전은 **전체 이행률표 CSV 자동 조회**와 **3기간 종전규정 비교상한**을 반영했습니다.
+- 이번 버전은 **전체 이행률표 CSV 자동 조회**, **3기간 종전규정 비교상한**, **퇴직수당 재직기간 감축개월**을 반영했습니다.
 - 처음 접속 시 기본 개인정보 예시는 넣지 않았습니다.
 - `적용보수 값 사용`을 켜면 메인 화면에 **입력 가이드(말 설명 + 공식 사이트 안내)** 가 나타납니다.
 - 필요한 숫자를 모두 입력하면 가이드는 자동으로 사라집니다.

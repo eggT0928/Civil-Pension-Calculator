@@ -67,7 +67,7 @@ OFFICIAL_A_VALUES = {
 
 GEPS_HOME_URL = "https://www.geps.or.kr/index"
 GEPS_ESTIMATE_GUIDE_TEXT = "공무원연금공단 홈페이지 → 연금복지포털 → 로그인 → 나의 연금예상액 → 상세보기"
-IMPLEMENTATION_TABLE_PATH = Path("dimplementation_factor_table.csv")
+IMPLEMENTATION_TABLE_PATH = "implementation_factor_table.csv"
 
 
 # =====================================

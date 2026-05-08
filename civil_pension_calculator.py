@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -22,7 +23,6 @@ DEFAULT_SALARY_GROWTH = 0.025
 DEFAULT_INFLATION = 0.020
 DEFAULT_PERIOD2_RATE = 0.019
 
-# 2016년 이후 지급률 단계적 인하 테이블
 PENSION_RATES = {
     2016: 1.878,
     2017: 1.856,
@@ -46,7 +46,6 @@ PENSION_RATES = {
     2035: 1.700,
 }
 
-# 인사혁신처 고시 연도별 전체 공무원 A값
 OFFICIAL_A_VALUES = {
     2011: 3950000,
     2012: 4150000,
@@ -68,48 +67,7 @@ OFFICIAL_A_VALUES = {
 
 GEPS_HOME_URL = "https://www.geps.or.kr/index"
 GEPS_ESTIMATE_GUIDE_TEXT = "공무원연금공단 홈페이지 → 연금복지포털 → 로그인 → 나의 연금예상액 → 상세보기"
-
-# =====================================
-# 신규자 열 이행률표
-# 2010.1.1 이후 신규 임용자용
-# 단위: %
-# =====================================
-NEW_MEMBER_IMPLEMENTATION_FACTORS = [
-    # 이후기간 최소, 이후기간 최대, 이행률(%)
-    (0, 1, 77.25),
-    (1, 2, 78.00),
-    (2, 3, 78.35),
-    (3, 4, 78.91),
-    (4, 5, 79.55),
-    (5, 6, 80.05),
-    (6, 7, 80.72),
-    (7, 8, 81.32),
-    (8, 9, 81.75),
-    (9, 10, 82.45),
-    (10, 11, 82.88),
-    (11, 12, 83.70),
-    (12, 13, 84.62),
-    (13, 14, 85.65),
-    (14, 15, 86.70),
-    (15, 16, 87.89),
-    (16, 17, 89.00),
-    (17, 18, 90.25),
-    (18, 19, 91.42),
-    (19, 20, 92.52),
-    (20, 21, 92.85),
-    (21, 22, 93.30),
-    (22, 23, 93.81),
-    (23, 24, 94.53),
-    (24, 25, 95.33),
-    (25, 26, 96.07),
-    (26, 27, 97.00),
-    (27, 28, 97.90),
-    (28, 29, 98.99),
-    (29, 30, 100.00),
-    (30, 31, 101.09),
-    (31, 32, 102.23),
-    (32, 999, 103.44),
-]
+IMPLEMENTATION_TABLE_PATH = Path("data/implementation_factor_table.csv")
 
 
 # =====================================
@@ -128,7 +86,7 @@ class Inputs:
     exact_b_value: float
     exact_redist_value: float
     exact_p1_value: float
-    job_type: str
+    retirement_basis: str
     manual_implementation_factor_pct: Optional[float]
 
 
@@ -147,6 +105,7 @@ class Result:
     inferred_redist_value: float
 
     pre_2016_service_years: float
+    before_2010_service_years: float
     after_2010_service_years: float
     service_cap_years: int
     recognized_service_years: float
@@ -184,6 +143,77 @@ class Result:
 
 
 # =====================================
+# 표 로딩 / 조회
+# =====================================
+@st.cache_data
+def load_implementation_table() -> pd.DataFrame:
+    if not IMPLEMENTATION_TABLE_PATH.exists():
+        return pd.DataFrame(
+            columns=[
+                "old_label", "old_min", "old_max",
+                "new_label", "new_min", "new_max",
+                "factor_pct", "factor_decimal",
+            ]
+        )
+
+    df = pd.read_csv(IMPLEMENTATION_TABLE_PATH)
+    numeric_cols = ["old_min", "old_max", "new_min", "new_max", "factor_pct", "factor_decimal"]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["factor_pct"])
+
+
+def find_implementation_factor_from_table(
+    table: pd.DataFrame,
+    entry_date: date,
+    before_2010_years: float,
+    after_2010_years: float,
+    manual_implementation_factor_pct: Optional[float] = None,
+) -> tuple[float, str]:
+    """
+    반환값:
+    - factor: 103.44%이면 1.0344
+    - source: 조회 방식 설명
+    """
+    if manual_implementation_factor_pct is not None and manual_implementation_factor_pct > 0:
+        return manual_implementation_factor_pct / 100, "수동 입력"
+
+    if table.empty:
+        return 1.0, "이행률표 파일 없음: 기본 100%"
+
+    # 33년 초과자는 33년에 해당하는 비율을 적용한다는 규정 취지에 맞춰
+    # 33년 이상이면 표의 32~33년 구간으로 조회한다.
+    lookup_after = min(max(after_2010_years, 0.0), 32.999999)
+
+    if entry_date >= date(2010, 1, 1):
+        candidates = table[
+            (table["old_label"] == "신규자")
+            & (table["new_min"] <= lookup_after)
+            & (lookup_after < table["new_max"])
+        ]
+        if candidates.empty:
+            return 1.0, "신규자열 조회 실패: 기본 100%"
+        row = candidates.iloc[0]
+        return float(row["factor_pct"]) / 100, f"이행률표 자동조회: 신규자 / {row['new_label']}"
+
+    lookup_before = min(max(before_2010_years, 0.0), 32.999999)
+
+    candidates = table[
+        (table["old_label"] != "신규자")
+        & (table["old_min"] <= lookup_before)
+        & (lookup_before < table["old_max"])
+        & (table["new_min"] <= lookup_after)
+        & (lookup_after < table["new_max"])
+    ]
+
+    if candidates.empty:
+        return 1.0, "전체 이행률표 조회 실패: 기본 100%"
+
+    row = candidates.iloc[0]
+    return float(row["factor_pct"]) / 100, f"이행률표 자동조회: 종전 {row['old_label']} / 이후 {row['new_label']}"
+
+
+# =====================================
 # 유틸
 # =====================================
 def won(value: float) -> str:
@@ -208,12 +238,6 @@ def month_index(d: date) -> int:
     return d.year * 12 + d.month
 
 
-def months_inclusive(start_date: date, end_date: date) -> int:
-    if end_date < start_date:
-        return 0
-    return month_index(end_date) - month_index(start_date) + 1
-
-
 def overlap_months(
     start_date: date,
     end_date: date,
@@ -225,12 +249,12 @@ def overlap_months(
     return max(0, e - s + 1)
 
 
-def get_default_retirement_date(current_age: int, job_type: str) -> date:
-    retirement_age = 60 if "일반공무원" in job_type else 62
+def get_default_retirement_date(current_age: int, retirement_basis: str) -> date:
+    retirement_age = 60 if "60세" in retirement_basis else 62
     years_left = max(0, retirement_age - current_age)
     retire_year = CURRENT_YEAR + years_left
 
-    if "교원" in job_type:
+    if "교원" in retirement_basis:
         return date(retire_year, 3, 1) - timedelta(days=1)
     return date(retire_year, 12, 31)
 
@@ -330,36 +354,11 @@ def estimate_b_and_redist(current_standard_income: float, current_a_value: float
     return capped_b, est_redist
 
 
-def get_new_member_implementation_factor(after_2010_years: float) -> float:
-    for min_y, max_y, factor_pct in NEW_MEMBER_IMPLEMENTATION_FACTORS:
-        if min_y <= after_2010_years < max_y:
-            return factor_pct / 100
-    return 1.0
-
-
-def get_implementation_factor(
-    entry_date: date,
-    after_2010_years: float,
-    manual_implementation_factor_pct: Optional[float],
-) -> tuple[float, str]:
-    if manual_implementation_factor_pct is not None and manual_implementation_factor_pct > 0:
-        return manual_implementation_factor_pct / 100, "수동 입력"
-
-    if entry_date >= date(2010, 1, 1):
-        factor = get_new_member_implementation_factor(after_2010_years)
-        return factor, "신규자열 자동 적용"
-
-    return 1.0, "2010년 이전 임용자: 전체표 미반영, 기본 100%"
-
-
 # =====================================
 # 연금 계산
 # =====================================
 def calculate_service_years(entry_date: date, retirement_date: date):
     # 월 기준 계산
-    # 1기간: 2009.12.31 이전
-    # 2기간: 2010.1.1 ~ 2015.12.31
-    # 3기간: 2016.1.1 이후
     p1_start = date(1970, 1, 1)
     p1_end = date(2009, 12, 31)
     p2_start = date(2010, 1, 1)
@@ -385,6 +384,7 @@ def calculate_service_years(entry_date: date, retirement_date: date):
         "raw_y2": raw_y2,
         "raw_y3": raw_y3,
         "pre_2016_service_years": pre_2016,
+        "before_2010_service_years": y1,
         "after_2010_service_years": y2 + y3,
         "cap_years": cap_years,
         "y1": y1,
@@ -395,7 +395,7 @@ def calculate_service_years(entry_date: date, retirement_date: date):
     }
 
 
-def calculate_pension(inputs: Inputs) -> Result:
+def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Result:
     retirement_year = inputs.retirement_date.year
     years_to_retire = max(0.0, years_between(CURRENT_DATE, inputs.retirement_date))
     retirement_age_est = inputs.current_age + years_to_retire
@@ -422,8 +422,10 @@ def calculate_pension(inputs: Inputs) -> Result:
         else inferred_redist_value
     )
 
-    implementation_factor, implementation_factor_source = get_implementation_factor(
+    implementation_factor, implementation_factor_source = find_implementation_factor_from_table(
+        table=implementation_table,
         entry_date=inputs.entry_date,
+        before_2010_years=service["before_2010_service_years"],
         after_2010_years=service["after_2010_service_years"],
         manual_implementation_factor_pct=inputs.manual_implementation_factor_pct,
     )
@@ -491,10 +493,7 @@ def calculate_pension(inputs: Inputs) -> Result:
 
     monthly_pension_today = period1_monthly + period2_monthly + period3_monthly
 
-    # 퇴직 시점 명목가치
     monthly_pension_nominal = monthly_pension_today * ((1 + inputs.salary_growth) ** years_to_retire)
-
-    # 물가할인 현재가치
     monthly_pension_real = monthly_pension_nominal / ((1 + inputs.inflation) ** years_to_retire)
 
     # 퇴직수당 간이 추정
@@ -539,6 +538,7 @@ def calculate_pension(inputs: Inputs) -> Result:
         inferred_b_value=inferred_b_value,
         inferred_redist_value=inferred_redist_value,
         pre_2016_service_years=service["pre_2016_service_years"],
+        before_2010_service_years=service["before_2010_service_years"],
         after_2010_service_years=service["after_2010_service_years"],
         service_cap_years=service["cap_years"],
         recognized_service_years=service["recognized_service_years"],
@@ -675,20 +675,31 @@ def render_exact_input_guide(
 # =====================================
 # UI
 # =====================================
+implementation_table = load_implementation_table()
+
 st.title("🏛️ 공무원연금 시뮬레이터")
 st.markdown(
     "파일 자동 읽기 없이, **직접 입력 방식**으로 안정적으로 계산하는 버전입니다. "
-    "2010년 이후 신규 임용자는 신규자열 이행률을 자동 반영합니다."
+    "이번 버전은 전체 이행률표 CSV를 읽어 자동 반영합니다."
 )
+
+if implementation_table.empty:
+    st.error(
+        "`data/implementation_factor_table.csv` 파일을 찾지 못했습니다. "
+        "이행률은 기본 100%로 계산됩니다."
+    )
 
 with st.sidebar:
     st.header("1. 기본 정보 입력")
 
-    job_type = st.radio(
-        "직종 선택",
-        ["일반공무원 (정년 60세)", "교원 (정년 62세)"],
+    retirement_basis = st.radio(
+        "기본 정년 기준 선택",
+        ["일반공무원 기준 (정년 60세)", "교원 기준 (정년 62세)"],
         index=1,
+        help="공무원연금 산식은 동일합니다. 이 선택은 예상 퇴직일 자동 계산용입니다.",
     )
+
+    st.caption("공무원연금 산식은 동일하고, 여기서는 정년 기준만 다르게 적용합니다.")
 
     current_contribution = st.number_input(
         "현재 매월 납부하는 일반기여금 (원)",
@@ -718,12 +729,12 @@ with st.sidebar:
     if use_custom_retirement_date:
         retirement_date = st.date_input(
             "예상 퇴직일",
-            value=get_default_retirement_date(int(current_age), job_type),
+            value=get_default_retirement_date(int(current_age), retirement_basis),
             min_value=date(2000, 1, 1),
             max_value=date(2100, 12, 31),
         )
     else:
-        retirement_date = get_default_retirement_date(int(current_age), job_type)
+        retirement_date = get_default_retirement_date(int(current_age), retirement_basis)
         st.caption(f"자동 계산된 예상 퇴직일: **{retirement_date.strftime('%Y-%m-%d')}**")
 
     st.divider()
@@ -785,7 +796,7 @@ with st.sidebar:
         use_manual_implementation_factor = st.toggle(
             "재직기간별 적용비율(이행률) 직접 입력",
             value=False,
-            help="2010년 이후 신규 임용자는 자동 적용됩니다. 공단값과 맞춰보고 싶을 때만 직접 입력하세요.",
+            help="기본값은 CSV 표 자동 조회입니다. 공단값과 맞춰보고 싶을 때만 직접 입력하세요.",
         )
 
         manual_implementation_factor_pct = None
@@ -801,9 +812,6 @@ with st.sidebar:
             )
 
 
-# =====================================
-# 메인 가이드 표시
-# =====================================
 if use_exact_data:
     render_exact_input_guide(
         entry_date,
@@ -828,11 +836,11 @@ inputs = Inputs(
     exact_b_value=float(exact_b_value or 0),
     exact_redist_value=float(exact_redist_value or 0),
     exact_p1_value=float(exact_p1_value or 0),
-    job_type=job_type,
+    retirement_basis=retirement_basis,
     manual_implementation_factor_pct=manual_implementation_factor_pct,
 )
 
-res = calculate_pension(inputs)
+res = calculate_pension(inputs, implementation_table)
 
 
 # =====================================
@@ -913,6 +921,7 @@ with left:
                 "추정 B값(적용보수 미입력 시)",
                 "추정 소득재분배 반영값(적용보수 미입력 시)",
                 "2016.1.1 기준 재직기간",
+                "2010년 이전 인정 재직기간",
                 "2010년 이후 인정 재직기간",
                 "재직기간 상한",
                 "적용 이행률",
@@ -928,6 +937,7 @@ with left:
                 won(res.inferred_b_value),
                 won(res.inferred_redist_value),
                 f"{res.pre_2016_service_years:.2f}년",
+                f"{res.before_2010_service_years:.2f}년",
                 f"{res.after_2010_service_years:.2f}년",
                 f"{res.service_cap_years}년",
                 f"{res.implementation_factor_pct:.2f}%",
@@ -994,9 +1004,6 @@ with right:
     st.bar_chart(chart_df)
 
 
-# =====================================
-# 상태 메시지
-# =====================================
 if use_exact_data:
     missing_exact = get_missing_exact_fields(
         entry_date,
@@ -1018,16 +1025,7 @@ else:
         "더 정확히 계산하려면 '적용보수 값 사용'을 켜고 직접 입력하세요."
     )
 
-if inputs.entry_date < date(2010, 1, 1) and not use_manual_implementation_factor:
-    st.warning(
-        "⚠️ 2010년 이전 임용자는 전체 이행률표가 아직 반영되지 않아 이행률 100%로 계산됩니다. "
-        "공단 예상액과 맞춰보고 싶다면 고급 설정에서 이행률을 직접 입력하세요."
-    )
 
-
-# =====================================
-# 설명
-# =====================================
 st.subheader("연금 계산 공식 설명")
 
 formula_df = pd.DataFrame(
@@ -1055,7 +1053,7 @@ st.markdown(
 - **B값**: 개인 평균 기준소득월액입니다.
 - **소득재분배 반영 기준소득월액**: 2016년 이후 구간 계산에 들어가는 보정된 기준 소득입니다.
 - **이행률**: 재직기간별 기준소득월액에 적용하는 비율입니다.
-- **2010년 이후 신규 임용자**는 신규자 열 이행률을 자동 적용합니다.
+- 이 버전은 `data/implementation_factor_table.csv`의 전체 이행률표를 읽어 자동 적용합니다.
 - **현재 기여금 기반 추정모드**에서는 `현재 기여금 ÷ 9%`로 현재 기준소득월액을 역산한 뒤 추정합니다.
 - **적용보수 직접입력 모드**에서는 사용자가 직접 넣은 수치를 우선 사용합니다.
 """
@@ -1066,8 +1064,7 @@ st.markdown(
     """
 - 이 앱은 **공식 산정액이 아닌 추정용 시뮬레이터**입니다.
 - 파일 자동 읽기 기능은 제거하고, **직접 입력 방식으로 단순화**했습니다.
-- 이번 버전은 **2010년 이후 신규 임용자용 이행률표**를 우선 반영했습니다.
-- 2010년 이전 임용자의 전체 이행률표는 아직 자동 반영하지 않았습니다.
+- 이번 버전은 **전체 이행률표 CSV 자동 조회**를 반영했습니다.
 - `적용보수 값 사용`을 켜면 메인 화면에 **입력 가이드(말 설명 + 공식 사이트 안내)** 가 나타납니다.
 - 필요한 숫자를 모두 입력하면 가이드는 자동으로 사라집니다.
 - 퇴직수당과 연금일시금은 **간이 추정**입니다.

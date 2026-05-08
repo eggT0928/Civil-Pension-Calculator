@@ -92,7 +92,7 @@ class Inputs:
     use_exact_data: bool
     exact_b_value: float
     exact_redist_value: float
-    exact_p1_value: float
+    exact_p1_pension_value: float
     retirement_basis: str
     manual_implementation_factor_pct: Optional[float]
     retirement_allowance_deduction_months: int
@@ -453,8 +453,8 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
     )
 
     actual_p1_value = (
-        inputs.exact_p1_value
-        if inputs.use_exact_data and inputs.exact_p1_value > 0
+        inputs.exact_p1_pension_value
+        if inputs.use_exact_data and inputs.exact_p1_pension_value > 0
         else current_standard_income
     )
     actual_b_value = (
@@ -664,7 +664,7 @@ def get_missing_exact_fields(
     entry_date: date,
     exact_b_value: Optional[float],
     exact_redist_value: Optional[float],
-    exact_p1_value: Optional[float],
+    exact_p1_pension_value: Optional[float],
 ):
     missing = []
 
@@ -672,8 +672,8 @@ def get_missing_exact_fields(
         missing.append("개인 평균 기준소득월액(B값)")
     if is_missing_amount(exact_redist_value):
         missing.append("소득재분배 반영 기준소득월액")
-    if entry_date <= date(2009, 12, 31) and is_missing_amount(exact_p1_value):
-        missing.append("2009년 이전 평균 보수월액")
+    if entry_date <= date(2009, 12, 31) and is_missing_amount(exact_p1_pension_value):
+        missing.append("2009.12.31 이전기간 <Ⅰ기간> - 연금 칸 금액")
 
     return missing
 
@@ -682,13 +682,13 @@ def render_exact_input_guide(
     entry_date: date,
     exact_b_value: Optional[float],
     exact_redist_value: Optional[float],
-    exact_p1_value: Optional[float],
+    exact_p1_pension_value: Optional[float],
 ):
     missing = get_missing_exact_fields(
         entry_date,
         exact_b_value,
         exact_redist_value,
-        exact_p1_value,
+        exact_p1_pension_value,
     )
 
     if not missing:
@@ -711,10 +711,10 @@ def render_exact_input_guide(
 
 - **개인 평균 기준소득월액 (B값)**
 - **소득재분배 반영 기준소득월액**
-- **2009년 이전 평균 보수월액** (해당자만)
+- **2009.12.31 이전기간 <Ⅰ기간> - 연금 칸 금액** (해당자만)
 
 쉼표는 빼고 숫자만 넣어도 됩니다.  
-예: `3,807,467` → `3807467`
+예: `1,756,625` → `1756625`
             """
         )
 
@@ -739,12 +739,12 @@ def render_exact_input_guide(
             "입력칸": [
                 "개인 평균 기준소득월액 (B값)",
                 "소득재분배 반영 기준소득월액",
-                "2009년 이전 평균 보수월액",
+                "2009.12.31 이전기간 <Ⅰ기간> - 연금 칸 금액",
             ],
             "서류에서 찾는 항목": [
                 "적용보수 표의 '개인 평균 기준소득월액'",
                 "적용보수 표의 '2016년 이후 소득재분배 반영 평균 기준소득월액'",
-                "2009.12.31 이전 재직기간이 있는 경우 그 구간의 평균 보수월액",
+                "적용보수 표에서 2009.12.31 이전기간 <Ⅰ기간> 아래의 '연금' 칸 금액",
             ],
             "입력 필요 여부": [
                 "항상 필요",
@@ -846,7 +846,7 @@ with st.sidebar:
 
     exact_b_value = None
     exact_redist_value = None
-    exact_p1_value = None
+    exact_p1_pension_value = None
 
     if use_exact_data:
         st.caption("공단 서류를 보고 숫자를 직접 입력합니다.")
@@ -867,12 +867,17 @@ with st.sidebar:
             placeholder="예: 5264041",
         )
 
-        exact_p1_value = st.number_input(
-            "2009년 이전 평균 보수월액 (해당 시만)",
+        exact_p1_pension_value = st.number_input(
+            "2009.12.31 이전기간 <Ⅰ기간> - 연금 칸 금액",
             min_value=0,
             value=None,
             step=10000,
-            placeholder="해당 없으면 비워두기",
+            placeholder="예: 1756625",
+            help=(
+                "적용보수 표에서 2009.12.31 이전기간 <Ⅰ기간> 아래 "
+                "'일시금/퇴직수당/연금' 중 '연금' 칸 금액을 입력하세요. "
+                "해당 기간이 없으면 비워둡니다."
+            ),
         )
 
     st.divider()
@@ -965,7 +970,7 @@ if use_exact_data:
         entry_date,
         exact_b_value,
         exact_redist_value,
-        exact_p1_value,
+        exact_p1_pension_value,
     )
 
 
@@ -983,7 +988,7 @@ inputs = Inputs(
     use_exact_data=use_exact_data,
     exact_b_value=float(exact_b_value or 0),
     exact_redist_value=float(exact_redist_value or 0),
-    exact_p1_value=float(exact_p1_value or 0),
+    exact_p1_pension_value=float(exact_p1_pension_value or 0),
     retirement_basis=retirement_basis,
     manual_implementation_factor_pct=manual_implementation_factor_pct,
     retirement_allowance_deduction_months=int(retirement_allowance_deduction_months),
@@ -1175,7 +1180,7 @@ if use_exact_data:
         entry_date,
         exact_b_value,
         exact_redist_value,
-        exact_p1_value,
+        exact_p1_pension_value,
     )
 
     if missing_exact:
@@ -1203,7 +1208,7 @@ formula_df = pd.DataFrame(
             "2016.1.1 이후 재직기간",
         ],
         "기본 계산방식": [
-            "과거 경과규정 반영(간이식)",
+            "2009.12.31 이전기간 <Ⅰ기간>의 연금 칸 금액을 사용",
             "B값 × 이행률 × 연수 × 지급률(기본 1.9%)",
             "개정산식 계산 후 종전규정 비교액과 비교하여 더 낮은 금액 적용",
         ],
@@ -1218,6 +1223,7 @@ st.markdown(
 - **3기간**: 2016년 이후 재직기간입니다.
 - **B값**: 개인 평균 기준소득월액입니다.
 - **소득재분배 반영 기준소득월액**: 2016년 이후 구간 계산에 들어가는 보정된 기준 소득입니다.
+- **2009.12.31 이전기간 <Ⅰ기간> - 연금 칸 금액**: 공단 적용보수 표에서 Ⅰ기간 아래 `일시금/퇴직수당/연금` 중 **연금** 칸 금액을 입력합니다.
 - **이행률**: 재직기간별 기준소득월액에 적용하는 비율입니다.
 - **3기간 보정**: 개정산식으로 계산한 금액이 종전규정 비교액보다 크면 종전규정 비교액을 적용합니다.
 - **퇴직수당 감축개월**: 공단 화면에서 퇴직급여 재직기간과 퇴직수당 재직기간이 다를 때 그 차이만큼 입력합니다.
@@ -1235,6 +1241,7 @@ st.markdown(
 - 이번 버전은 **전체 이행률표 CSV 자동 조회**, **3기간 종전규정 비교상한**, **퇴직수당 재직기간 감축개월**을 반영했습니다.
 - 처음 접속 시 기본 개인정보 예시는 넣지 않았습니다.
 - `적용보수 값 사용`을 켜면 메인 화면에 **입력 가이드(말 설명 + 공식 사이트 안내)** 가 나타납니다.
+- 2009.12.31 이전기간이 있는 경우, 적용보수 표의 **연금 칸 금액**을 입력해야 합니다.
 - 필요한 숫자를 모두 입력하면 가이드는 자동으로 사라집니다.
 - 퇴직수당과 연금일시금은 **간이 추정**입니다.
 - 실제 지급액은 공무원연금공단의 상세 이력, 경과규정, 실제 기준소득월액 데이터 등에 따라 달라질 수 있습니다.

@@ -46,6 +46,7 @@ PENSION_RATES = {
     2035: 1.700,
 }
 
+# 참고용 과거 A값
 OFFICIAL_A_VALUES = {
     2011: 3950000,
     2012: 4150000,
@@ -62,8 +63,14 @@ OFFICIAL_A_VALUES = {
     2023: 5440000,
     2024: 5520000,
     2025: 5710000,
-    2026: 5710000,
+    2026: 5950000,
 }
+
+# 공무원 전체 기준소득월액 평균액 적용기간
+A_VALUE_PERIODS = [
+    (date(2025, 5, 1), date(2026, 4, 30), 5710000),
+    (date(2026, 5, 1), date(2027, 4, 30), 5950000),
+]
 
 GEPS_HOME_URL = "https://www.geps.or.kr/index"
 GEPS_ESTIMATE_GUIDE_TEXT = "공무원연금공단 홈페이지 → 연금복지포털 → 로그인 → 나의 연금예상액 → 상세보기"
@@ -190,9 +197,7 @@ def load_implementation_table(path_str: str, file_mtime: float) -> pd.DataFrame:
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=numeric_cols)
-
-    return df
+    return df.dropna(subset=numeric_cols)
 
 
 def find_implementation_factor_from_table(
@@ -283,6 +288,19 @@ def overlap_months(
     s = max(month_index(start_date), month_index(period_start))
     e = min(month_index(end_date), month_index(period_end))
     return max(0, e - s + 1)
+
+
+def get_current_a_value(target_date: date) -> int:
+    for start, end, value in A_VALUE_PERIODS:
+        if start <= target_date <= end:
+            return value
+
+    # 테이블 범위를 벗어난 경우에는 가장 최신값을 사용
+    if target_date > A_VALUE_PERIODS[-1][1]:
+        return A_VALUE_PERIODS[-1][2]
+
+    # 과거 날짜는 연도 기준 참고값 사용
+    return OFFICIAL_A_VALUES.get(target_date.year, 5710000)
 
 
 def get_default_retirement_date(current_age: int, retirement_basis: str) -> date:
@@ -441,8 +459,11 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
     service = calculate_service_years(inputs.entry_date, inputs.retirement_date)
 
     current_standard_income = infer_current_standard_income(inputs.current_contribution)
-    current_a_value = OFFICIAL_A_VALUES[max(OFFICIAL_A_VALUES.keys())]
-    inferred_b_value, inferred_redist_value = estimate_b_and_redist(current_standard_income, current_a_value)
+    current_a_value = get_current_a_value(CURRENT_DATE)
+    inferred_b_value, inferred_redist_value = estimate_b_and_redist(
+        current_standard_income,
+        current_a_value,
+    )
 
     actual_p1_value = (
         inputs.exact_p1_value
@@ -611,19 +632,23 @@ def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Res
 # =====================================
 # 적용보수 입력 가이드
 # =====================================
+def is_missing_amount(value: Optional[float]) -> bool:
+    return value is None or value <= 0
+
+
 def get_missing_exact_fields(
     entry_date: date,
-    exact_b_value: float,
-    exact_redist_value: float,
-    exact_p1_value: float,
+    exact_b_value: Optional[float],
+    exact_redist_value: Optional[float],
+    exact_p1_value: Optional[float],
 ):
     missing = []
 
-    if exact_b_value <= 0:
+    if is_missing_amount(exact_b_value):
         missing.append("개인 평균 기준소득월액(B값)")
-    if exact_redist_value <= 0:
+    if is_missing_amount(exact_redist_value):
         missing.append("소득재분배 반영 기준소득월액")
-    if entry_date <= date(2009, 12, 31) and exact_p1_value <= 0:
+    if entry_date <= date(2009, 12, 31) and is_missing_amount(exact_p1_value):
         missing.append("2009년 이전 평균 보수월액")
 
     return missing
@@ -631,9 +656,9 @@ def get_missing_exact_fields(
 
 def render_exact_input_guide(
     entry_date: date,
-    exact_b_value: float,
-    exact_redist_value: float,
-    exact_p1_value: float,
+    exact_b_value: Optional[float],
+    exact_redist_value: Optional[float],
+    exact_p1_value: Optional[float],
 ):
     missing = get_missing_exact_fields(
         entry_date,
@@ -718,7 +743,8 @@ implementation_table = load_implementation_table(str(IMPLEMENTATION_TABLE_PATH),
 
 st.title("🏛️ 공무원연금 시뮬레이터")
 st.markdown(
-    "파일 자동 읽기 없이, **직접 입력 방식**으로 안정적으로 계산하는 버전입니다. "
+    "왼쪽 사이드바에 **현재 일반기여금, 현재 나이, 최초임용일**을 입력하면 "
+    "예상 공무원연금을 계산합니다. "
     "이번 버전은 전체 이행률표 CSV를 읽어 자동 반영합니다."
 )
 
@@ -743,8 +769,9 @@ with st.sidebar:
     current_contribution = st.number_input(
         "현재 매월 납부하는 일반기여금 (원)",
         min_value=0,
-        value=396500,
+        value=None,
         step=1000,
+        placeholder="예: 396500",
         help="현재 실제로 내고 있는 일반기여금을 입력하세요.",
     )
 
@@ -752,38 +779,50 @@ with st.sidebar:
         "현재 나이 (세)",
         min_value=20,
         max_value=80,
-        value=33,
+        value=None,
         step=1,
+        placeholder="예: 33",
     )
 
     entry_date = st.date_input(
         "최초임용일",
-        value=date(2016, 3, 1),
+        value=None,
         min_value=date(1970, 1, 1),
         max_value=date(2100, 12, 31),
     )
 
     use_custom_retirement_date = st.toggle("예상 퇴직일 직접 입력", value=False)
 
+    retirement_date = None
+
     if use_custom_retirement_date:
+        default_retirement_date = (
+            get_default_retirement_date(int(current_age), retirement_basis)
+            if current_age is not None
+            else None
+        )
+
         retirement_date = st.date_input(
             "예상 퇴직일",
-            value=get_default_retirement_date(int(current_age), retirement_basis),
+            value=default_retirement_date,
             min_value=date(2000, 1, 1),
             max_value=date(2100, 12, 31),
         )
     else:
-        retirement_date = get_default_retirement_date(int(current_age), retirement_basis)
-        st.caption(f"자동 계산된 예상 퇴직일: **{retirement_date.strftime('%Y-%m-%d')}**")
+        if current_age is not None:
+            retirement_date = get_default_retirement_date(int(current_age), retirement_basis)
+            st.caption(f"자동 계산된 예상 퇴직일: **{retirement_date.strftime('%Y-%m-%d')}**")
+        else:
+            st.caption("현재 나이를 입력하면 예상 퇴직일이 자동 계산됩니다.")
 
     st.divider()
 
     st.header("2. 적용보수 직접 입력 (선택)")
     use_exact_data = st.toggle("✅ 적용보수 값 사용", value=False)
 
-    exact_b_value = 0
-    exact_redist_value = 0
-    exact_p1_value = 0
+    exact_b_value = None
+    exact_redist_value = None
+    exact_p1_value = None
 
     if use_exact_data:
         st.caption("공단 서류를 보고 숫자를 직접 입력합니다.")
@@ -791,22 +830,25 @@ with st.sidebar:
         exact_b_value = st.number_input(
             "개인 평균 기준소득월액 (B값)",
             min_value=0,
-            value=0,
+            value=None,
             step=10000,
+            placeholder="예: 3807467",
         )
 
         exact_redist_value = st.number_input(
             "소득재분배 반영 기준소득월액",
             min_value=0,
-            value=0,
+            value=None,
             step=10000,
+            placeholder="예: 5076495",
         )
 
         exact_p1_value = st.number_input(
             "2009년 이전 평균 보수월액 (해당 시만)",
             min_value=0,
-            value=0,
+            value=None,
             step=10000,
+            placeholder="해당 없으면 비워두기",
         )
 
     st.divider()
@@ -849,6 +891,31 @@ with st.sidebar:
                 step=0.01,
                 help="예: 103.44를 입력하면 1.0344배로 계산합니다.",
             )
+
+
+# =====================================
+# 필수 입력 검증
+# =====================================
+missing_required = []
+
+if current_contribution is None:
+    missing_required.append("현재 매월 납부하는 일반기여금")
+
+if current_age is None:
+    missing_required.append("현재 나이")
+
+if entry_date is None:
+    missing_required.append("최초임용일")
+
+if retirement_date is None:
+    missing_required.append("예상 퇴직일")
+
+if missing_required:
+    st.info(
+        "👈 왼쪽 사이드바에서 아래 항목을 입력하면 연금 계산이 시작됩니다.\n\n"
+        + "\n".join([f"- {item}" for item in missing_required])
+    )
+    st.stop()
 
 
 if use_exact_data:
@@ -1104,6 +1171,7 @@ st.markdown(
 - 이 앱은 **공식 산정액이 아닌 추정용 시뮬레이터**입니다.
 - 파일 자동 읽기 기능은 제거하고, **직접 입력 방식으로 단순화**했습니다.
 - 이번 버전은 **전체 이행률표 CSV 자동 조회**를 반영했습니다.
+- 처음 접속 시 기본 개인정보 예시는 넣지 않았습니다.
 - `적용보수 값 사용`을 켜면 메인 화면에 **입력 가이드(말 설명 + 공식 사이트 안내)** 가 나타납니다.
 - 필요한 숫자를 모두 입력하면 가이드는 자동으로 사라집니다.
 - 퇴직수당과 연금일시금은 **간이 추정**입니다.

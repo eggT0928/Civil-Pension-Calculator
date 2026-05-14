@@ -92,6 +92,9 @@ class UserInputs:
     salary_growth_rate: float
     inflation_rate: float
     current_a_value: int
+    estimate_b_ratio: float
+    estimate_redist_ratio: float
+    estimate_post2010_lump_allowance_ratio: float
     use_exact_data: bool
     exact_b_value: Optional[int]
     exact_redist_value: Optional[int]
@@ -253,20 +256,24 @@ def get_accrual_rate(year: int) -> float:
 def estimate_exact_values_from_contribution(
     current_contribution: int,
     current_a_value: float,
+    b_ratio: float = EST_B_VALUE_RATIO,
+    redist_ratio: float = 1.0,
+    post2010_lump_allowance_ratio: float = EST_POST2010_LUMP_ALLOWANCE_RATIO,
 ) -> Tuple[float, float, float, float]:
     """
     현재 일반기여금으로 적용보수 관련 값을 추정합니다.
 
     핵심 보정식:
     - 현재 기준소득월액 = 현재 일반기여금 / 9%
-    - 개인 평균 기준소득월액 B값 = 현재 기준소득월액 × 0.925
-    - 2016년 이후 소득재분배 반영 기준소득월액 = A값과 B값의 평균
-    - 2010년 이후 일시금/퇴직수당 칸 금액 = 현재 기준소득월액 × 1.184
+    - 개인 평균 기준소득월액 B값 = 현재 기준소득월액 × B값 추정계수
+    - 2016년 이후 소득재분배 반영 기준소득월액 = (A값과 B값의 평균) × 소득재분배 보정계수
+    - 2010년 이후 일시금/퇴직수당 칸 금액 = 현재 기준소득월액 × 일시금/퇴직수당 추정계수
     """
     current_standard_income = current_contribution / CONTRIBUTION_RATE if current_contribution > 0 else 0.0
-    inferred_b_value = current_standard_income * EST_B_VALUE_RATIO
-    inferred_redist_value = (float(current_a_value) + inferred_b_value) / 2 if current_a_value > 0 else inferred_b_value
-    inferred_post2010_lump_allowance = current_standard_income * EST_POST2010_LUMP_ALLOWANCE_RATIO
+    inferred_b_value = current_standard_income * b_ratio
+    base_redist_value = (float(current_a_value) + inferred_b_value) / 2 if current_a_value > 0 else inferred_b_value
+    inferred_redist_value = base_redist_value * redist_ratio
+    inferred_post2010_lump_allowance = current_standard_income * post2010_lump_allowance_ratio
 
     return (
         current_standard_income,
@@ -286,6 +293,9 @@ def build_estimated_values(inputs: UserInputs) -> EstimatedValues:
     ) = estimate_exact_values_from_contribution(
         current_contribution=inputs.current_contribution,
         current_a_value=inputs.current_a_value,
+        b_ratio=inputs.estimate_b_ratio,
+        redist_ratio=inputs.estimate_redist_ratio,
+        post2010_lump_allowance_ratio=inputs.estimate_post2010_lump_allowance_ratio,
     )
 
     exact_b = safe_positive(inputs.exact_b_value)
@@ -599,6 +609,42 @@ def render_sidebar() -> UserInputs:
         ),
     )
 
+    with st.sidebar.expander("기여금 기반 추정 보정값", expanded=False):
+        st.caption(
+            "공단 조회서 값과 기여금 기반 추정값의 차이를 줄이고 싶을 때 조정합니다. "
+            "보고서 값이 있다면 직접 입력이 가장 정확하고, 이 보정값은 보고서가 없을 때의 추정 개선용입니다."
+        )
+
+        estimate_b_ratio = st.number_input(
+            "B값 추정계수",
+            min_value=0.70,
+            max_value=1.20,
+            value=EST_B_VALUE_RATIO,
+            step=0.005,
+            format="%.3f",
+            help="B값 추정 = 현재 기준소득월액 × 이 계수",
+        )
+
+        estimate_redist_ratio = st.number_input(
+            "2016년 이후 소득재분배값 보정계수",
+            min_value=0.80,
+            max_value=1.20,
+            value=1.000,
+            step=0.005,
+            format="%.3f",
+            help="소득재분배값 추정 = (A값 + 추정 B값) ÷ 2 × 이 계수",
+        )
+
+        estimate_post2010_lump_allowance_ratio = st.number_input(
+            "2010년 이후 일시금/퇴직수당 추정계수",
+            min_value=0.80,
+            max_value=1.50,
+            value=EST_POST2010_LUMP_ALLOWANCE_RATIO,
+            step=0.005,
+            format="%.3f",
+            help="2010년 이후 일시금/퇴직수당값 추정 = 현재 기준소득월액 × 이 계수",
+        )
+
     return UserInputs(
         job_type=job_type,
         birth_date=birth_date,
@@ -609,6 +655,9 @@ def render_sidebar() -> UserInputs:
         salary_growth_rate=float(salary_growth_rate),
         inflation_rate=float(inflation_rate),
         current_a_value=int(current_a_value),
+        estimate_b_ratio=float(estimate_b_ratio),
+        estimate_redist_ratio=float(estimate_redist_ratio),
+        estimate_post2010_lump_allowance_ratio=float(estimate_post2010_lump_allowance_ratio),
         use_exact_data=bool(use_exact_data),
         exact_b_value=exact_b_value,
         exact_redist_value=exact_redist_value,
@@ -655,9 +704,9 @@ def render_estimation_panel(values: EstimatedValues, inputs: UserInputs) -> None
             이후 적용보수 추정은 다음 보정식을 사용합니다.
 
             ```text
-            개인 평균 기준소득월액 B값 ≈ 현재 기준소득월액 × {EST_B_VALUE_RATIO}
-            2016년 이후 소득재분배 반영 기준소득월액 ≈ (A값 + B값) ÷ 2
-            2010년 이후 일시금/퇴직수당 칸 금액 ≈ 현재 기준소득월액 × {EST_POST2010_LUMP_ALLOWANCE_RATIO}
+            개인 평균 기준소득월액 B값 ≈ 현재 기준소득월액 × {inputs.estimate_b_ratio}
+            2016년 이후 소득재분배 반영 기준소득월액 ≈ (A값 + B값) ÷ 2 × {inputs.estimate_redist_ratio}
+            2010년 이후 일시금/퇴직수당 칸 금액 ≈ 현재 기준소득월액 × {inputs.estimate_post2010_lump_allowance_ratio}
             ```
 
             공단 보고서의 실제 값이 있다면, 직접 입력한 값이 추정값보다 우선 적용됩니다.
@@ -672,6 +721,36 @@ def render_estimation_panel(values: EstimatedValues, inputs: UserInputs) -> None
 
     if inputs.use_exact_data:
         st.info("직접 입력한 값이 있는 항목은 직접 입력값을 우선 사용했습니다. 0원으로 둔 항목은 현재 일반기여금 기반 추정값을 사용했습니다.")
+
+        calibration_rows = []
+        if safe_positive(inputs.exact_b_value) > 0 and values.current_standard_income > 0:
+            calibration_rows.append({
+                "항목": "B값",
+                "보고서값": won(safe_positive(inputs.exact_b_value)),
+                "기여금 역산값 대비 계수": f"{safe_positive(inputs.exact_b_value) / values.current_standard_income:.3f}",
+                "현재 적용 추정계수": f"{inputs.estimate_b_ratio:.3f}",
+            })
+        if safe_positive(inputs.exact_redist_value) > 0 and values.inferred_redist_value > 0:
+            base_redist = (inputs.current_a_value + values.inferred_b_value) / 2 if inputs.current_a_value > 0 else values.inferred_b_value
+            if base_redist > 0:
+                calibration_rows.append({
+                    "항목": "2016년 이후 소득재분배값",
+                    "보고서값": won(safe_positive(inputs.exact_redist_value)),
+                    "기본 추정식 대비 계수": f"{safe_positive(inputs.exact_redist_value) / base_redist:.3f}",
+                    "현재 적용 추정계수": f"{inputs.estimate_redist_ratio:.3f}",
+                })
+        if safe_positive(inputs.exact_post2010_lump_allowance_value) > 0 and values.current_standard_income > 0:
+            calibration_rows.append({
+                "항목": "2010년 이후 일시금/퇴직수당값",
+                "보고서값": won(safe_positive(inputs.exact_post2010_lump_allowance_value)),
+                "기여금 역산값 대비 계수": f"{safe_positive(inputs.exact_post2010_lump_allowance_value) / values.current_standard_income:.3f}",
+                "현재 적용 추정계수": f"{inputs.estimate_post2010_lump_allowance_ratio:.3f}",
+            })
+
+        if calibration_rows:
+            st.subheader("③ 보고서 기반 개인 보정계수 참고")
+            st.caption("이 표의 계수를 고급 설정의 보정값에 반영하면, 보고서가 없는 사용자에 대한 기여금 기반 추정 오차를 줄이는 데 도움이 됩니다.")
+            st.dataframe(calibration_rows, hide_index=True, use_container_width=True)
     else:
         st.warning("공단 보고서 값을 직접 입력하지 않았기 때문에 현재 일반기여금 기반 추정값으로 계산합니다.")
 

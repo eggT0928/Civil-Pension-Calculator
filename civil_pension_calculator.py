@@ -61,7 +61,16 @@ CONTRIBUTION_RATE = 0.09
 EST_B_VALUE_RATIO = 0.925
 EST_POST2010_LUMP_ALLOWANCE_RATIO = 1.184
 
-DEFAULT_A_VALUE = 5_440_000
+# 전체 공무원 평균 기준소득월액(A값)
+# 적용기간은 보통 매년 5월~다음 해 4월 기준으로 바뀝니다.
+# 새 고시값이 나오면 아래 표에 한 줄만 추가하면 됩니다.
+A_VALUE_BY_PERIOD = [
+    (date(2024, 5, 1), date(2025, 4, 30), 5_520_000),
+    (date(2025, 5, 1), date(2026, 4, 30), 5_710_000),
+    (date(2026, 5, 1), date(2027, 4, 30), 5_950_000),
+]
+
+DEFAULT_A_VALUE = A_VALUE_BY_PERIOD[-1][2]
 DEFAULT_CURRENT_CONTRIBUTION = 395_000
 
 JOB_TEACHER = "교원"
@@ -165,6 +174,21 @@ def get_recommended_retirement_date(job_type: str, birth_date: date) -> date:
     if reach_date.month <= 6:
         return date(reach_date.year, 6, 30)
     return date(reach_date.year, 12, 31)
+
+
+def get_auto_a_value(base_date: date) -> int:
+    """
+    현재 기준일에 맞는 전체 공무원 평균 기준소득월액(A값)을 자동 선택합니다.
+    표에 없는 과거/미래 기간은 가장 가까운 등록값을 사용합니다.
+    """
+    for start_date, end_date, value in A_VALUE_BY_PERIOD:
+        if start_date <= base_date <= end_date:
+            return value
+
+    if base_date < A_VALUE_BY_PERIOD[0][0]:
+        return A_VALUE_BY_PERIOD[0][2]
+
+    return A_VALUE_BY_PERIOD[-1][2]
 
 
 def won(value: float) -> str:
@@ -541,12 +565,21 @@ def render_sidebar() -> UserInputs:
         step=0.1,
     )
 
+    auto_a_value = get_auto_a_value(base_date)
+    st.sidebar.caption(
+        f"현재 기준일({base_date.strftime('%Y-%m-%d')}) 기준 A값 자동 선택: {auto_a_value:,}원"
+    )
+
     current_a_value = st.sidebar.number_input(
         "전체 공무원 평균 기준소득월액 (A값, 추정용)",
         min_value=0,
-        value=DEFAULT_A_VALUE,
+        value=auto_a_value,
         step=10_000,
-        help="정확히 모르면 기본값을 그대로 두어도 됩니다. 2016년 이후 소득재분배 반영값 추정에 사용됩니다.",
+        help=(
+            "현재 기준일에 따라 자동 선택된 A값입니다. "
+            "새 고시값과 다르거나 직접 확인한 값이 있으면 수정할 수 있습니다. "
+            "2016년 이후 소득재분배 반영값 추정에 사용됩니다."
+        ),
     )
 
     return UserInputs(

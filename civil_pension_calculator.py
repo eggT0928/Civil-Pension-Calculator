@@ -463,15 +463,32 @@ def render_sidebar() -> UserInputs:
 
     suggested_retirement_date = get_recommended_retirement_date(job_type, birth_date)
 
-    st.sidebar.caption(f"선택한 구분 기준 자동 제안 퇴직일: {suggested_retirement_date.strftime('%Y-%m-%d')}")
-
-    retirement_date = st.sidebar.date_input(
-        "퇴직예정일",
-        value=suggested_retirement_date,
-        min_value=date(1980, 1, 1),
-        max_value=date(2100, 12, 31),
-        help="원래 버전처럼 퇴직예정일을 직접 넣는 방식입니다. 자동 제안값이 맞지 않으면 직접 수정하세요.",
+    st.sidebar.caption(
+        f"선택한 구분 기준 자동 제안 퇴직일: {suggested_retirement_date.strftime('%Y-%m-%d')}"
     )
+
+    use_custom_retirement_date = st.sidebar.toggle(
+        "퇴직예정일 직접 설정",
+        value=False,
+        help=(
+            "끄면 교원/일반직 공무원 구분과 생년월일을 기준으로 퇴직예정일을 자동 설정합니다. "
+            "켜면 퇴직예정일을 직접 수정할 수 있습니다."
+        ),
+    )
+
+    if use_custom_retirement_date:
+        retirement_date = st.sidebar.date_input(
+            "퇴직예정일",
+            value=suggested_retirement_date,
+            min_value=date(1980, 1, 1),
+            max_value=date(2100, 12, 31),
+            help="공단 예상퇴직급여 조회서와 비교할 때는 보고서의 퇴직예정일과 맞춰 입력하세요.",
+        )
+    else:
+        retirement_date = suggested_retirement_date
+        st.sidebar.success(
+            f"퇴직예정일 자동 적용: {retirement_date.strftime('%Y-%m-%d')}"
+        )
 
     current_contribution = st.sidebar.number_input(
         "현재 일반기여금 월 납부액",
@@ -659,31 +676,104 @@ def render_estimation_panel(values: EstimatedValues, inputs: UserInputs) -> None
         st.warning("공단 보고서 값을 직접 입력하지 않았기 때문에 현재 일반기여금 기반 추정값으로 계산합니다.")
 
 
-def render_result_panel(result: PensionResult) -> None:
-    st.subheader("예상 결과")
+def render_result_panel(result: PensionResult, values: EstimatedValues, inputs: UserInputs) -> None:
+    """예전 대시보드 스타일의 결과 화면입니다."""
+    st.subheader("💰 퇴직 시 예상 월 연금액")
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("월 연금 명목금액", manwon(result.nominal_monthly_pension))
-    col2.metric("월 연금 현재가치", manwon(result.real_monthly_pension))
-    col3.metric("일시금 명목 추정", eokwon(result.nominal_lump_sum))
-    col4.metric("퇴직수당 명목 추정", eokwon(result.nominal_retirement_allowance))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(
+        "월 연금 (물가할인 현재가치)",
+        won(result.real_monthly_pension),
+        help="퇴직 시점 명목 연금액을 물가상승률로 할인한 현재 체감가치입니다.",
+    )
+    c2.metric(
+        "월 연금 (퇴직 시 명목가치)",
+        won(result.nominal_monthly_pension),
+        help="퇴직 시점에 실제 통장에 찍힐 것으로 추정되는 액면 금액입니다.",
+    )
+    c3.metric(
+        "총 예상 재직기간",
+        f"{result.total_service_years:.2f}년",
+        help="임용일부터 퇴직예정일까지의 단순 추정 재직기간입니다.",
+    )
+    c4.metric(
+        "퇴직예정일",
+        inputs.retirement_date.strftime("%Y-%m-%d"),
+        help="사이드바에서 직접 수정할 수 있습니다.",
+    )
 
-    st.markdown("---")
+    st.caption(
+        f"평균 지급률: **{percent(result.avg_accrual_rate)}** / "
+        f"보수상승률: **{inputs.salary_growth_rate:.1f}%** / "
+        f"물가상승률: **{inputs.inflation_rate:.1f}%**"
+    )
 
-    col5, col6, col7 = st.columns(3)
-    col5.metric("일시금 현재가치", eokwon(result.real_lump_sum))
-    col6.metric("퇴직수당 현재가치", eokwon(result.real_retirement_allowance))
-    col7.metric("총 가치 현재가치 추정", eokwon(result.total_real_value))
+    st.divider()
 
-    st.markdown("---")
+    st.subheader("💼 퇴직 시 예상 일시금액 (참고용)")
+    st.markdown("퇴직수당과 연금일시금은 공단 공식 산정액이 아니라 적용보수 입력값을 활용한 참고 추정치입니다.")
 
-    detail_rows = [
-        {"구분": "월 연금", "퇴직시점 명목금액": won(result.nominal_monthly_pension), "현재가치 환산": won(result.real_monthly_pension)},
-        {"구분": "일시금", "퇴직시점 명목금액": won(result.nominal_lump_sum), "현재가치 환산": won(result.real_lump_sum)},
-        {"구분": "퇴직수당", "퇴직시점 명목금액": won(result.nominal_retirement_allowance), "현재가치 환산": won(result.real_retirement_allowance)},
-        {"구분": "연금 25년 수령 가정 + 일시금 + 퇴직수당", "퇴직시점 명목금액": won(result.total_nominal_value), "현재가치 환산": won(result.total_real_value)},
-    ]
-    st.dataframe(detail_rows, hide_index=True, use_container_width=True)
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("퇴직수당 (현재가치)", won(result.real_retirement_allowance))
+    d2.metric("퇴직수당 (명목가치)", won(result.nominal_retirement_allowance))
+    d3.metric("연금일시금 (현재가치)", won(result.real_lump_sum))
+    d4.metric("연금일시금 (명목가치)", won(result.nominal_lump_sum))
+
+    st.info(
+        f"💡 일시금으로 전액 수령 시 총액 [현재가치]: "
+        f"{won(result.real_retirement_allowance + result.real_lump_sum)} / "
+        f"[명목가치]: {won(result.nominal_retirement_allowance + result.nominal_lump_sum)}"
+    )
+
+    st.divider()
+
+    left, right = st.columns([1, 1])
+
+    with left:
+        st.subheader("📊 적용된 기준 소득")
+        income_rows = [
+            {"적용 구간": "1기간 연금용", "기준 소득": won(values.p1_pension_value)},
+            {"적용 구간": "2기간 연금용 B값", "기준 소득": won(values.actual_b_value)},
+            {"적용 구간": "3기간 연금용 소득재분배값", "기준 소득": won(values.actual_p3_value)},
+            {"적용 구간": "2010년 이후 일시금/퇴직수당", "기준 소득": won(values.post2010_lump_allowance_value)},
+        ]
+        st.dataframe(income_rows, use_container_width=True, hide_index=True)
+
+        st.subheader("📘 핵심 계산 근거")
+        basis_rows = [
+            {"항목": "구분", "값": inputs.job_type},
+            {"항목": "생년월일", "값": inputs.birth_date.strftime("%Y-%m-%d")},
+            {"항목": "현재 기준일", "값": inputs.base_date.strftime("%Y-%m-%d")},
+            {"항목": "임용일", "값": inputs.appointment_date.strftime("%Y-%m-%d")},
+            {"항목": "퇴직예정일", "값": inputs.retirement_date.strftime("%Y-%m-%d")},
+            {"항목": "현재 나이", "값": f"{result.current_age:.2f}세"},
+            {"항목": "현재까지 재직기간", "값": f"{result.service_years_to_base:.2f}년"},
+            {"항목": "퇴직까지 남은 기간", "값": f"{result.remaining_service_years:.2f}년"},
+            {"항목": "총 예상 재직기간", "값": f"{result.total_service_years:.2f}년"},
+            {"항목": "현재 일반기여금", "값": won(inputs.current_contribution)},
+            {"항목": "현재 기준소득월액 역산", "값": won(values.current_standard_income)},
+            {"항목": "전체 공무원 A값", "값": won(inputs.current_a_value)},
+            {"항목": "평균 지급률", "값": percent(result.avg_accrual_rate)},
+        ]
+        st.dataframe(basis_rows, use_container_width=True, hide_index=True)
+
+    with right:
+        st.subheader("📈 산출 내역")
+        pension_rows = [
+            {"구분": "월 연금", "퇴직 시 명목금액": won(result.nominal_monthly_pension), "현재가치": won(result.real_monthly_pension)},
+            {"구분": "연금일시금", "퇴직 시 명목금액": won(result.nominal_lump_sum), "현재가치": won(result.real_lump_sum)},
+            {"구분": "퇴직수당", "퇴직 시 명목금액": won(result.nominal_retirement_allowance), "현재가치": won(result.real_retirement_allowance)},
+            {"구분": "연금 25년 수령 가정 + 일시금 + 퇴직수당", "퇴직 시 명목금액": won(result.total_nominal_value), "현재가치": won(result.total_real_value)},
+        ]
+        st.dataframe(pension_rows, use_container_width=True, hide_index=True)
+
+        st.subheader("🧾 적용보수 추정/직접입력 비교")
+        compare_rows = [
+            {"항목": "B값 추정", "추정값": won(values.inferred_b_value), "실제 적용값": won(values.actual_b_value)},
+            {"항목": "2016년 이후 소득재분배값", "추정값": won(values.inferred_redist_value), "실제 적용값": won(values.actual_p3_value)},
+            {"항목": "2010년 이후 일시금/퇴직수당값", "추정값": won(values.inferred_post2010_lump_allowance), "실제 적용값": won(values.post2010_lump_allowance_value)},
+        ]
+        st.dataframe(compare_rows, use_container_width=True, hide_index=True)
 
 
 def render_interpretation(result: PensionResult) -> None:
@@ -769,13 +859,10 @@ def main() -> None:
     values = build_estimated_values(inputs)
     result = calculate_pension(inputs, values)
 
-    render_input_overview(inputs, result)
-    st.markdown("---")
-
     tab1, tab2, tab3 = st.tabs(["계산 결과", "적용보수 확인", "주의사항"])
 
     with tab1:
-        render_result_panel(result)
+        render_result_panel(result, values, inputs)
         render_interpretation(result)
 
     with tab2:

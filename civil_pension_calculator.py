@@ -1,1400 +1,676 @@
-from dataclasses import dataclass
-from datetime import date, timedelta
-from pathlib import Path
-from typing import Optional
+# app.py
+# 공무원연금 예상 계산기 Streamlit 앱
+# 실행: streamlit run app.py
 
-import pandas as pd
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Tuple
+
+import math
 import streamlit as st
 
-# =====================================
-# 기본 설정
-# =====================================
+
+# =========================================================
+# 0. 기본 설정
+# =========================================================
+
 st.set_page_config(
-    page_title="공무원연금 시뮬레이터",
-    page_icon="🏛️",
+    page_title="공무원연금 예상 계산기",
+    page_icon="📊",
     layout="wide",
 )
 
-CURRENT_DATE = date.today()
-CURRENT_YEAR = CURRENT_DATE.year
 
+# =========================================================
+# 1. 지급률 / 연령 / 보정값 설정
+# =========================================================
+
+# 2016년 이후 연도별 연금지급률
+# 공무원연금 개혁 이후 단계적으로 낮아지는 구조를 반영한 단순 추정 테이블입니다.
+ACCRUAL_RATE_BY_YEAR: Dict[int, float] = {
+    2016: 0.01878,
+    2017: 0.01856,
+    2018: 0.01834,
+    2019: 0.01812,
+    2020: 0.01790,
+    2021: 0.01780,
+    2022: 0.01770,
+    2023: 0.01760,
+    2024: 0.01750,
+    2025: 0.01740,
+    2026: 0.01730,
+    2027: 0.01720,
+    2028: 0.01710,
+    2029: 0.01700,
+    2030: 0.01690,
+    2031: 0.01680,
+    2032: 0.01670,
+    2033: 0.01660,
+    2034: 0.01650,
+    2035: 0.01640,
+}
+
+FINAL_ACCRUAL_RATE = 0.01640
 CONTRIBUTION_RATE = 0.09
-DEFAULT_SALARY_GROWTH = 0.025
-DEFAULT_INFLATION = 0.020
-DEFAULT_PERIOD2_RATE = 0.019
 
-PENSION_RATES = {
-    2016: 1.878,
-    2017: 1.856,
-    2018: 1.834,
-    2019: 1.812,
-    2020: 1.790,
-    2021: 1.780,
-    2022: 1.770,
-    2023: 1.760,
-    2024: 1.750,
-    2025: 1.740,
-    2026: 1.736,
-    2027: 1.732,
-    2028: 1.728,
-    2029: 1.724,
-    2030: 1.720,
-    2031: 1.716,
-    2032: 1.712,
-    2033: 1.708,
-    2034: 1.704,
-    2035: 1.700,
-}
-
-OFFICIAL_A_VALUES = {
-    2011: 3950000,
-    2012: 4150000,
-    2013: 4350000,
-    2014: 4470000,
-    2015: 4670000,
-    2016: 4910000,
-    2017: 5100000,
-    2018: 5220000,
-    2019: 5300000,
-    2020: 5390000,
-    2021: 5350000,
-    2022: 5390000,
-    2023: 5440000,
-    2024: 5520000,
-    2025: 5710000,
-    2026: 5950000,
-}
-
-A_VALUE_PERIODS = [
-    (date(2025, 5, 1), date(2026, 4, 30), 5710000),
-    (date(2026, 5, 1), date(2027, 4, 30), 5950000),
-]
-
-GEPS_HOME_URL = "https://www.geps.or.kr/index"
-GEPS_ESTIMATE_GUIDE_TEXT = "공무원연금공단 홈페이지 → 연금복지포털 → 로그인 → 나의 연금예상액 → 상세보기"
-
-BASE_DIR = Path(__file__).resolve().parent
-IMPLEMENTATION_TABLE_PATH = BASE_DIR / "implementation_factor_table.csv"
+# 적용보수 추정 보정값
+# 현재 기여금으로 역산한 기준소득월액과 공단 보고서상 평균값의 차이를 줄이기 위한 경험적 보정값입니다.
+EST_B_VALUE_RATIO = 0.925
+EST_POST2010_LUMP_ALLOWANCE_RATIO = 1.184
 
 
-# =====================================
-# 데이터 클래스
-# =====================================
+# =========================================================
+# 2. 데이터 구조
+# =========================================================
+
 @dataclass
-class Inputs:
+class UserInputs:
     current_age: int
-    entry_date: date
-    retirement_date: date
+    appointment_year: int
+    appointment_month: int
+    retirement_age: int
     current_contribution: int
-    salary_growth: float
-    inflation: float
-    period2_rate: float
-
+    salary_growth_rate: float
+    inflation_rate: float
+    current_a_value: int
     use_exact_data: bool
-    exact_b_value: float
-    exact_redist_value: float
-
-    exact_p1_pension_value: float
-    exact_p1_lump_value: float
-    exact_p1_allowance_value: float
-    exact_post2010_lump_allowance_value: float
-
-    retirement_basis: str
-    manual_implementation_factor_pct: Optional[float]
-    retirement_allowance_deduction_months: int
+    exact_b_value: Optional[int]
+    exact_redist_value: Optional[int]
+    exact_post2010_lump_allowance_value: Optional[int]
+    exact_p1_lump_value: Optional[int]
+    exact_p1_allowance_value: Optional[int]
+    exact_p1_pension_value: Optional[int]
 
 
 @dataclass
-class Result:
-    retirement_year: int
-    years_to_retire: float
-    retirement_age_est: float
-    pension_start_age: int
-    pension_start_year: int
-    gap_years: float
-
+class EstimatedValues:
     current_standard_income: float
-    current_a_value: float
     inferred_b_value: float
     inferred_redist_value: float
-
-    actual_total_service_years: float
-    pre_2016_service_years: float
-    before_2010_service_years: float
-    after_2010_service_years: float
-    service_cap_years: int
-    recognized_service_years: float
-
-    raw_y1: float
-    raw_y2: float
-    raw_y3: float
-    y1: float
-    y2: float
-    y3: float
-
-    implementation_factor: float
-    implementation_factor_pct: float
-    implementation_factor_source: str
-    implementation_factor_lookup_years: float
-
-    base_p1_income: float
-    base_p2_income: float
-    base_p3_income: float
-    avg_rate_2016plus: float
-
-    monthly_pension_real: float
-    monthly_pension_nominal: float
-
-    period1_monthly: float
-    period2_monthly: float
-    period3_monthly: float
-
-    period3_redistribution_monthly: float
-    period3_personal_monthly: float
-    period3_over30_monthly: float
-    period3_new_formula_monthly: float
-    period3_old_rule_cap_monthly: float
-    period3_applied_rule: str
-
-    retirement_allowance_real: float
-    retirement_allowance_nominal: float
-    retirement_allowance_service_years: float
-    retirement_allowance_deduction_months: int
-    retirement_allowance_rate_pct: float
-    p1_retirement_allowance_real: float
-    post2010_retirement_allowance_real: float
-
-    pension_lump_sum_real: float
-    pension_lump_sum_nominal: float
-    p1_lump_sum_real: float
-    post2010_lump_sum_real: float
+    inferred_post2010_lump_allowance: float
+    actual_b_value: float
+    actual_p3_value: float
+    post2010_lump_allowance_value: float
+    p1_lump_value: float
+    p1_allowance_value: float
+    p1_pension_value: float
 
 
-# =====================================
-# 이행률표 로딩 / 조회
-# =====================================
-@st.cache_data
-def load_implementation_table(path_str: str, file_mtime: float) -> pd.DataFrame:
-    path = Path(path_str)
-
-    required_cols = [
-        "old_label",
-        "old_min",
-        "old_max",
-        "new_label",
-        "new_min",
-        "new_max",
-        "factor_pct",
-    ]
-
-    if not path.exists():
-        return pd.DataFrame(columns=required_cols)
-
-    try:
-        df = pd.read_csv(path, encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        df = pd.read_csv(path, encoding="cp949")
-
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    if missing_cols:
-        st.error(f"이행률표 CSV에 필요한 컬럼이 없습니다: {', '.join(missing_cols)}")
-        return pd.DataFrame(columns=required_cols)
-
-    df["old_label"] = df["old_label"].astype(str).str.strip()
-    df["new_label"] = df["new_label"].astype(str).str.strip()
-
-    numeric_cols = ["old_min", "old_max", "new_min", "new_max", "factor_pct"]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df.dropna(subset=numeric_cols)
+@dataclass
+class PensionResult:
+    total_service_years: float
+    years_until_retirement: int
+    nominal_monthly_pension: float
+    real_monthly_pension: float
+    nominal_lump_sum: float
+    real_lump_sum: float
+    nominal_retirement_allowance: float
+    real_retirement_allowance: float
+    total_nominal_value: float
+    total_real_value: float
+    replacement_monthly_income: float
 
 
-def find_implementation_factor_from_table(
-    table: pd.DataFrame,
-    entry_date: date,
-    before_2010_years: float,
-    after_2010_years: float,
-    actual_total_service_years: float,
-    manual_implementation_factor_pct: Optional[float] = None,
-) -> tuple[float, str, float]:
-    """
-    이행률표 조회.
+# =========================================================
+# 3. 유틸 함수
+# =========================================================
 
-    중요 수정:
-    - 2010.1.1 이후 임용자(신규자)는 월 단위 인정기간이 아니라
-      실제 날짜 기준 총 재직연수(actual_total_service_years)로 이행률 구간을 조회합니다.
-    - 공단 화면상 재직기간은 12년 0월처럼 표시되어도,
-      실제 날짜상 만 12년 미만이면 11년 이상~12년 미만 구간을 적용하는 케이스가 있습니다.
-    """
-    if manual_implementation_factor_pct is not None and manual_implementation_factor_pct > 0:
-        return manual_implementation_factor_pct / 100, "수동 입력", actual_total_service_years
-
-    if table.empty:
-        return 1.0, "이행률표 파일 없음: 기본 100%", actual_total_service_years
-
-    if entry_date >= date(2010, 1, 1):
-        lookup_after = min(max(actual_total_service_years, 0.0), 32.999999)
-
-        candidates = table[
-            (table["old_label"] == "신규자")
-            & (table["new_min"] <= lookup_after)
-            & (lookup_after < table["new_max"])
-        ]
-
-        if candidates.empty:
-            return 1.0, "신규자열 조회 실패: 기본 100%", lookup_after
-
-        row = candidates.iloc[0]
-        return (
-            float(row["factor_pct"]) / 100,
-            f"이행률표 자동조회: 신규자 / {row['new_label']}",
-            lookup_after,
-        )
-
-    lookup_after = min(max(after_2010_years, 0.0), 32.999999)
-    lookup_before = min(max(before_2010_years, 0.0), 32.999999)
-
-    candidates = table[
-        (table["old_label"] != "신규자")
-        & (table["old_min"] <= lookup_before)
-        & (lookup_before < table["old_max"])
-        & (table["new_min"] <= lookup_after)
-        & (lookup_after < table["new_max"])
-    ]
-
-    if candidates.empty:
-        return 1.0, "전체 이행률표 조회 실패: 기본 100%", lookup_after
-
-    row = candidates.iloc[0]
-    return (
-        float(row["factor_pct"]) / 100,
-        f"이행률표 자동조회: 종전 {row['old_label']} / 이후 {row['new_label']}",
-        lookup_after,
-    )
-
-
-# =====================================
-# 유틸
-# =====================================
 def won(value: float) -> str:
-    return f"{int(round(value)):,}원"
+    """원 단위 금액을 보기 좋게 표시합니다."""
+    if value is None or math.isnan(float(value)):
+        return "-"
+    return f"{value:,.0f}원"
 
 
-def pct(value: float) -> str:
-    return f"{value:.2f}%"
+def manwon(value: float) -> str:
+    """원 단위 금액을 만 원 단위로 표시합니다."""
+    if value is None or math.isnan(float(value)):
+        return "-"
+    return f"{value / 10_000:,.1f}만 원"
 
 
-def years_between(start_date: date, end_date: date) -> float:
-    if end_date <= start_date:
+def eokwon(value: float) -> str:
+    """원 단위 금액을 억 원 단위로 표시합니다."""
+    if value is None or math.isnan(float(value)):
+        return "-"
+    return f"{value / 100_000_000:,.2f}억 원"
+
+
+def safe_positive(value: Optional[int | float]) -> float:
+    """None 또는 0 이하 값을 0으로 처리합니다."""
+    if value is None:
         return 0.0
-    return (end_date - start_date).days / 365.2425
+    try:
+        v = float(value)
+        return v if v > 0 else 0.0
+    except Exception:
+        return 0.0
 
 
-def year_fraction(d: date) -> float:
-    return d.year + ((d.timetuple().tm_yday - 1) / 365.2425)
-
-
-def month_index(d: date) -> int:
-    return d.year * 12 + d.month
-
-
-def overlap_months(
-    start_date: date,
-    end_date: date,
-    period_start: date,
-    period_end: date,
-) -> int:
-    s = max(month_index(start_date), month_index(period_start))
-    e = min(month_index(end_date), month_index(period_end))
-    return max(0, e - s + 1)
-
-
-def get_current_a_value(target_date: date) -> int:
-    for start, end, value in A_VALUE_PERIODS:
-        if start <= target_date <= end:
-            return value
-
-    if target_date > A_VALUE_PERIODS[-1][1]:
-        return A_VALUE_PERIODS[-1][2]
-
-    return OFFICIAL_A_VALUES.get(target_date.year, 5710000)
-
-
-def get_default_retirement_date(current_age: int, retirement_basis: str) -> date:
-    retirement_age = 60 if "60세" in retirement_basis else 62
-    years_left = max(0, retirement_age - current_age)
-    retire_year = CURRENT_YEAR + years_left
-
-    if "교원" in retirement_basis:
-        return date(retire_year, 3, 1) - timedelta(days=1)
-
-    return date(retire_year, 12, 31)
-
-
-def pension_rate_for_year(year: int) -> float:
-    if year in PENSION_RATES:
-        return PENSION_RATES[year]
+def get_accrual_rate(year: int) -> float:
+    """해당 연도의 연금지급률을 반환합니다."""
+    if year in ACCRUAL_RATE_BY_YEAR:
+        return ACCRUAL_RATE_BY_YEAR[year]
     if year < 2016:
-        return 1.9
-    return 1.7
+        return ACCRUAL_RATE_BY_YEAR[2016]
+    return FINAL_ACCRUAL_RATE
 
 
-def weighted_average_rate(start_year_float: float, end_year_float: float) -> float:
-    if end_year_float <= start_year_float:
-        return 0.0
+def estimate_service_years(appointment_year: int, appointment_month: int, retirement_age: int, current_age: int) -> Tuple[float, int]:
+    """현재 나이와 정년 나이를 기준으로 남은 기간 및 총 재직기간을 단순 추정합니다."""
+    years_until_retirement = max(retirement_age - current_age, 0)
 
-    total_rate = 0.0
-    total_weight = 0.0
-    year = int(start_year_float)
+    # 현재 연도는 앱 실행 시점의 연도 대신 사용자가 입력한 나이 기반으로만 단순 추정합니다.
+    # 총 재직기간은 임용연도부터 정년까지의 긴 기간을 정확히 알기 어렵기 때문에,
+    # 현재까지 재직기간 + 남은 재직기간 형태가 아니라 임용연령을 역산하는 단순 모델로 처리합니다.
+    # 교사 신규 임용 대표값으로 만 24세 전후를 고려해 현재 나이와 임용 후 경과기간을 사용합니다.
+    current_year = 2026
+    elapsed_years = max(current_year - appointment_year + (1 - appointment_month) / 12, 0)
+    total_service_years = elapsed_years + years_until_retirement
 
-    while year < int(end_year_float) + 1:
-        s = max(start_year_float, year)
-        e = min(end_year_float, year + 1)
-        weight = max(0.0, e - s)
-
-        if weight > 0:
-            total_rate += pension_rate_for_year(year) * weight
-            total_weight += weight
-
-        year += 1
-
-    return total_rate / total_weight if total_weight > 0 else 0.0
+    return total_service_years, years_until_retirement
 
 
-def recognized_service_cap(pre_2016_service_years: float) -> int:
-    if pre_2016_service_years >= 21:
-        return 33
-    if pre_2016_service_years >= 17:
-        return 34
-    if pre_2016_service_years >= 15:
-        return 35
-    return 36
-
-
-def apply_service_cap(raw_y1: float, raw_y2: float, raw_y3: float, cap_years: int):
-    remaining = float(cap_years)
-
-    y1 = min(raw_y1, remaining)
-    remaining -= y1
-
-    y2 = min(raw_y2, max(0.0, remaining))
-    remaining -= y2
-
-    y3 = min(raw_y3, max(0.0, remaining))
-
-    return y1, y2, y3
-
-
-def retirement_allowance_rate(total_years: float) -> float:
-    if total_years < 1:
-        return 0.0
-    if total_years < 5:
-        return 0.065
-    if total_years < 10:
-        return 0.2275
-    if total_years < 15:
-        return 0.2925
-    if total_years < 20:
-        return 0.325
-    return 0.39
-
-
-def get_pension_start_age(entry_date: date, retirement_year: int) -> int:
-    if entry_date >= date(1996, 1, 1):
-        if retirement_year <= 2021:
-            return 60
-        if retirement_year <= 2023:
-            return 61
-        if retirement_year <= 2026:
-            return 62
-        if retirement_year <= 2029:
-            return 63
-        if retirement_year <= 2032:
-            return 64
-        return 65
-
-    return 60
-
-
-def infer_current_standard_income(current_contribution: int) -> float:
-    return current_contribution / CONTRIBUTION_RATE if current_contribution > 0 else 0.0
-
-
-def estimate_b_and_redist(current_standard_income: float, current_a_value: float):
-    est_b_value = current_standard_income * 0.90
-    capped_b = min(est_b_value, current_a_value * 1.6)
-    est_redist = (current_a_value + capped_b) / 2
-    return capped_b, est_redist
-
-
-def split_allowance_service_years(
-    y1: float,
-    y2: float,
-    y3: float,
-    deduction_months: int,
-) -> tuple[float, float, float]:
+def estimate_exact_values_from_contribution(current_contribution: int, current_a_value: float) -> Tuple[float, float, float, float]:
     """
-    퇴직수당 재직기간 감축개월을 최근 기간부터 차감합니다.
-    3기간 → 2기간 → 1기간 순서로 차감합니다.
+    현재 일반기여금으로 적용보수 관련 값을 추정합니다.
+
+    핵심:
+    - 현재 기준소득월액 = 현재 일반기여금 / 9%
+    - 개인 평균 기준소득월액 B값 = 현재 기준소득월액 × 0.925
+    - 2016년 이후 소득재분배 반영 기준소득월액 = A값과 B값의 평균
+    - 2010년 이후 일시금/퇴직수당 칸 금액 = 현재 기준소득월액 × 1.184
     """
-    deduction_years = max(0, deduction_months) / 12
+    current_standard_income = current_contribution / CONTRIBUTION_RATE if current_contribution > 0 else 0.0
+    inferred_b_value = current_standard_income * EST_B_VALUE_RATIO
+    inferred_redist_value = (float(current_a_value) + inferred_b_value) / 2 if current_a_value > 0 else inferred_b_value
+    inferred_post2010_lump_allowance = current_standard_income * EST_POST2010_LUMP_ALLOWANCE_RATIO
 
-    y3_adj = max(0.0, y3 - deduction_years)
-    remaining = max(0.0, deduction_years - y3)
-
-    y2_adj = max(0.0, y2 - remaining)
-    remaining = max(0.0, remaining - y2)
-
-    y1_adj = max(0.0, y1 - remaining)
-
-    return y1_adj, y2_adj, y3_adj
-
-
-# =====================================
-# 재직기간 계산
-# =====================================
-def calculate_service_years(entry_date: date, retirement_date: date):
-    p1_start = date(1970, 1, 1)
-    p1_end = date(2009, 12, 31)
-    p2_start = date(2010, 1, 1)
-    p2_end = date(2015, 12, 31)
-    p3_start = date(2016, 1, 1)
-    p3_end = date(2100, 12, 31)
-
-    raw_m1 = overlap_months(entry_date, retirement_date, p1_start, p1_end)
-    raw_m2 = overlap_months(entry_date, retirement_date, p2_start, p2_end)
-    raw_m3 = overlap_months(entry_date, retirement_date, p3_start, p3_end)
-
-    raw_y1 = raw_m1 / 12
-    raw_y2 = raw_m2 / 12
-    raw_y3 = raw_m3 / 12
-
-    pre_2016 = raw_y1 + raw_y2
-    cap_years = recognized_service_cap(pre_2016)
-
-    y1, y2, y3 = apply_service_cap(raw_y1, raw_y2, raw_y3, cap_years)
-
-    actual_total_service_years = years_between(entry_date, retirement_date)
-
-    return {
-        "actual_total_service_years": actual_total_service_years,
-        "raw_y1": raw_y1,
-        "raw_y2": raw_y2,
-        "raw_y3": raw_y3,
-        "pre_2016_service_years": pre_2016,
-        "before_2010_service_years": y1,
-        "after_2010_service_years": y2 + y3,
-        "cap_years": cap_years,
-        "y1": y1,
-        "y2": y2,
-        "y3": y3,
-        "recognized_service_years": y1 + y2 + y3,
-        "actual_start": year_fraction(entry_date),
-    }
-
-
-# =====================================
-# 핵심 계산
-# =====================================
-def calculate_pension(inputs: Inputs, implementation_table: pd.DataFrame) -> Result:
-    retirement_year = inputs.retirement_date.year
-    years_to_retire = max(0.0, years_between(CURRENT_DATE, inputs.retirement_date))
-    retirement_age_est = inputs.current_age + years_to_retire
-
-    service = calculate_service_years(inputs.entry_date, inputs.retirement_date)
-
-    current_standard_income = infer_current_standard_income(inputs.current_contribution)
-    current_a_value = get_current_a_value(CURRENT_DATE)
-    inferred_b_value, inferred_redist_value = estimate_b_and_redist(
+    return (
         current_standard_income,
-        current_a_value,
+        inferred_b_value,
+        inferred_redist_value,
+        inferred_post2010_lump_allowance,
     )
 
-    actual_p1_pension_value = (
-        inputs.exact_p1_pension_value
-        if inputs.use_exact_data and inputs.exact_p1_pension_value > 0
-        else current_standard_income
-    )
 
-    actual_p1_lump_value = (
-        inputs.exact_p1_lump_value
-        if inputs.use_exact_data and inputs.exact_p1_lump_value > 0
-        else actual_p1_pension_value
-    )
-
-    actual_p1_allowance_value = (
-        inputs.exact_p1_allowance_value
-        if inputs.use_exact_data and inputs.exact_p1_allowance_value > 0
-        else actual_p1_lump_value
-    )
-
-    actual_b_value = (
-        inputs.exact_b_value
-        if inputs.use_exact_data and inputs.exact_b_value > 0
-        else inferred_b_value
-    )
-
-    actual_p3_value = (
-        inputs.exact_redist_value
-        if inputs.use_exact_data and inputs.exact_redist_value > 0
-        else inferred_redist_value
-    )
-
-    post2010_lump_allowance_value = (
-        inputs.exact_post2010_lump_allowance_value
-        if inputs.use_exact_data and inputs.exact_post2010_lump_allowance_value > 0
-        else current_standard_income
-    )
-
+def build_estimated_values(inputs: UserInputs) -> EstimatedValues:
+    """사용자 직접 입력값이 있으면 직접 입력값을 우선하고, 없으면 현재 기여금 기반 추정값을 사용합니다."""
     (
-        implementation_factor,
-        implementation_factor_source,
-        implementation_factor_lookup_years,
-    ) = find_implementation_factor_from_table(
-        table=implementation_table,
-        entry_date=inputs.entry_date,
-        before_2010_years=service["before_2010_service_years"],
-        after_2010_years=service["after_2010_service_years"],
-        actual_total_service_years=service["actual_total_service_years"],
-        manual_implementation_factor_pct=inputs.manual_implementation_factor_pct,
+        current_standard_income,
+        inferred_b_value,
+        inferred_redist_value,
+        inferred_post2010_lump_allowance,
+    ) = estimate_exact_values_from_contribution(
+        current_contribution=inputs.current_contribution,
+        current_a_value=inputs.current_a_value,
     )
 
-    # 1기간 연금
-    period1_monthly = 0.0
-    if service["y1"] > 0:
-        if service["y1"] >= 20:
-            period1_monthly = (
-                actual_p1_pension_value * 0.5
-                + actual_p1_pension_value * (service["y1"] - 20) * 0.02
-            )
-        else:
-            period1_monthly = actual_p1_pension_value * service["y1"] * 0.025
+    exact_b = safe_positive(inputs.exact_b_value)
+    exact_redist = safe_positive(inputs.exact_redist_value)
+    exact_post2010 = safe_positive(inputs.exact_post2010_lump_allowance_value)
+    exact_p1_lump = safe_positive(inputs.exact_p1_lump_value)
+    exact_p1_allowance = safe_positive(inputs.exact_p1_allowance_value)
+    exact_p1_pension = safe_positive(inputs.exact_p1_pension_value)
 
-    # 2기간 연금
-    period2_monthly = 0.0
-    if service["y2"] > 0:
-        period2_monthly = actual_b_value * implementation_factor * service["y2"] * inputs.period2_rate
-
-    # 3기간 연금
-    period3_monthly = 0.0
-    period3_redistribution_monthly = 0.0
-    period3_personal_monthly = 0.0
-    period3_over30_monthly = 0.0
-    period3_new_formula_monthly = 0.0
-    period3_old_rule_cap_monthly = 0.0
-    period3_applied_rule = "3기간 없음"
-    avg_rate_2016plus = 0.0
-
-    if service["y3"] > 0:
-        period3_start = max(2016.0, service["actual_start"])
-        period3_end = period3_start + service["y3"]
-        avg_rate_2016plus = weighted_average_rate(period3_start, period3_end)
-
-        pre_2016_recognized_years = service["y1"] + service["y2"]
-        years_under_30 = min(service["y3"], max(0.0, 30.0 - pre_2016_recognized_years))
-        years_over_30 = max(0.0, service["y3"] - years_under_30)
-
-        avg_rate_under30 = weighted_average_rate(period3_start, period3_start + years_under_30)
-        avg_rate_over30 = weighted_average_rate(period3_start + years_under_30, period3_end)
-
-        period3_redistribution_monthly = (
-            actual_p3_value
-            * implementation_factor
-            * years_under_30
-            * 0.01
-        )
-
-        period3_personal_monthly = (
-            actual_b_value
-            * implementation_factor
-            * years_under_30
-            * max(0.0, avg_rate_under30 - 1.0)
-            / 100
-        )
-
-        period3_over30_monthly = (
-            actual_b_value
-            * implementation_factor
-            * years_over_30
-            * avg_rate_over30
-            / 100
-        )
-
-        period3_new_formula_monthly = (
-            period3_redistribution_monthly
-            + period3_personal_monthly
-            + period3_over30_monthly
-        )
-
-        period3_old_rule_cap_monthly = (
-            actual_b_value
-            * implementation_factor
-            * service["y3"]
-            * inputs.period2_rate
-        )
-
-        if period3_old_rule_cap_monthly > 0 and period3_new_formula_monthly > period3_old_rule_cap_monthly:
-            period3_monthly = period3_old_rule_cap_monthly
-            period3_applied_rule = "종전규정 비교액 적용"
-        else:
-            period3_monthly = period3_new_formula_monthly
-            period3_applied_rule = "개정산식 적용"
-
-    monthly_pension_today = period1_monthly + period2_monthly + period3_monthly
-
-    growth_factor = (1 + inputs.salary_growth) ** years_to_retire
-    inflation_factor = (1 + inputs.inflation) ** years_to_retire
-
-    monthly_pension_nominal = monthly_pension_today * growth_factor
-    monthly_pension_real = monthly_pension_nominal / inflation_factor
-
-    # 퇴직수당: 1기간과 2010년 이후기간 분리 계산
-    y1_allowance, y2_allowance, y3_allowance = split_allowance_service_years(
-        service["y1"],
-        service["y2"],
-        service["y3"],
-        inputs.retirement_allowance_deduction_months,
+    actual_b_value = exact_b if inputs.use_exact_data and exact_b > 0 else inferred_b_value
+    actual_p3_value = exact_redist if inputs.use_exact_data and exact_redist > 0 else inferred_redist_value
+    post2010_lump_allowance_value = (
+        exact_post2010 if inputs.use_exact_data and exact_post2010 > 0 else inferred_post2010_lump_allowance
     )
 
-    retirement_allowance_service_years = y1_allowance + y2_allowance + y3_allowance
-    allowance_rate_after2010 = retirement_allowance_rate(retirement_allowance_service_years)
-
-    p1_retirement_allowance_real = (
-        actual_p1_allowance_value
-        * y1_allowance
-        * 0.60
-    )
-
-    post2010_retirement_allowance_real = (
-        post2010_lump_allowance_value
-        * (y2_allowance + y3_allowance)
-        * allowance_rate_after2010
-    )
-
-    retirement_allowance_real = p1_retirement_allowance_real + post2010_retirement_allowance_real
-    retirement_allowance_nominal = retirement_allowance_real * growth_factor
-
-    # 연금일시금: 1기간과 2010년 이후기간 분리 계산
-    total_service_years = service["recognized_service_years"]
-
-    p1_lump_multiplier = 1.5 + max(0.0, total_service_years - 5.0) * 0.01
-    post2010_lump_multiplier = 0.975 + max(0.0, total_service_years - 5.0) * 0.0065
-
-    p1_lump_sum_real = (
-        actual_p1_lump_value
-        * service["y1"]
-        * p1_lump_multiplier
-    )
-
-    post2010_lump_sum_real = (
-        post2010_lump_allowance_value
-        * (service["y2"] + service["y3"])
-        * post2010_lump_multiplier
-    )
-
-    pension_lump_sum_real = p1_lump_sum_real + post2010_lump_sum_real
-    pension_lump_sum_nominal = pension_lump_sum_real * growth_factor
-
-    pension_start_age = get_pension_start_age(inputs.entry_date, retirement_year)
-    pension_start_year = retirement_year + max(0, pension_start_age - int(round(retirement_age_est)))
-    gap_years = max(0.0, pension_start_age - retirement_age_est)
-
-    return Result(
-        retirement_year=retirement_year,
-        years_to_retire=years_to_retire,
-        retirement_age_est=retirement_age_est,
-        pension_start_age=pension_start_age,
-        pension_start_year=pension_start_year,
-        gap_years=gap_years,
+    return EstimatedValues(
         current_standard_income=current_standard_income,
-        current_a_value=current_a_value,
         inferred_b_value=inferred_b_value,
         inferred_redist_value=inferred_redist_value,
-        actual_total_service_years=service["actual_total_service_years"],
-        pre_2016_service_years=service["pre_2016_service_years"],
-        before_2010_service_years=service["before_2010_service_years"],
-        after_2010_service_years=service["after_2010_service_years"],
-        service_cap_years=service["cap_years"],
-        recognized_service_years=service["recognized_service_years"],
-        raw_y1=service["raw_y1"],
-        raw_y2=service["raw_y2"],
-        raw_y3=service["raw_y3"],
-        y1=service["y1"],
-        y2=service["y2"],
-        y3=service["y3"],
-        implementation_factor=implementation_factor,
-        implementation_factor_pct=implementation_factor * 100,
-        implementation_factor_source=implementation_factor_source,
-        implementation_factor_lookup_years=implementation_factor_lookup_years,
-        base_p1_income=actual_p1_pension_value if service["y1"] > 0 else 0.0,
-        base_p2_income=actual_b_value if service["y2"] > 0 else 0.0,
-        base_p3_income=actual_p3_value if service["y3"] > 0 else 0.0,
-        avg_rate_2016plus=avg_rate_2016plus,
-        monthly_pension_real=monthly_pension_real,
-        monthly_pension_nominal=monthly_pension_nominal,
-        period1_monthly=period1_monthly,
-        period2_monthly=period2_monthly,
-        period3_monthly=period3_monthly,
-        period3_redistribution_monthly=period3_redistribution_monthly,
-        period3_personal_monthly=period3_personal_monthly,
-        period3_over30_monthly=period3_over30_monthly,
-        period3_new_formula_monthly=period3_new_formula_monthly,
-        period3_old_rule_cap_monthly=period3_old_rule_cap_monthly,
-        period3_applied_rule=period3_applied_rule,
-        retirement_allowance_real=retirement_allowance_real,
-        retirement_allowance_nominal=retirement_allowance_nominal,
-        retirement_allowance_service_years=retirement_allowance_service_years,
-        retirement_allowance_deduction_months=inputs.retirement_allowance_deduction_months,
-        retirement_allowance_rate_pct=allowance_rate_after2010 * 100,
-        p1_retirement_allowance_real=p1_retirement_allowance_real,
-        post2010_retirement_allowance_real=post2010_retirement_allowance_real,
-        pension_lump_sum_real=pension_lump_sum_real,
-        pension_lump_sum_nominal=pension_lump_sum_nominal,
-        p1_lump_sum_real=p1_lump_sum_real,
-        post2010_lump_sum_real=post2010_lump_sum_real,
+        inferred_post2010_lump_allowance=inferred_post2010_lump_allowance,
+        actual_b_value=actual_b_value,
+        actual_p3_value=actual_p3_value,
+        post2010_lump_allowance_value=post2010_lump_allowance_value,
+        p1_lump_value=exact_p1_lump,
+        p1_allowance_value=exact_p1_allowance,
+        p1_pension_value=exact_p1_pension,
     )
 
 
-# =====================================
-# 적용보수 입력 가이드
-# =====================================
-def is_missing_amount(value: Optional[float]) -> bool:
-    return value is None or value <= 0
+# =========================================================
+# 4. 계산 로직
+# =========================================================
+
+def calculate_average_accrual_rate(appointment_year: int, total_service_years: float) -> float:
+    """재직기간 동안의 평균 지급률을 단순 평균으로 계산합니다."""
+    if total_service_years <= 0:
+        return FINAL_ACCRUAL_RATE
+
+    full_years = max(int(round(total_service_years)), 1)
+    rates = []
+    for i in range(full_years):
+        year = appointment_year + i
+        rates.append(get_accrual_rate(year))
+    return sum(rates) / len(rates)
 
 
-def get_missing_exact_fields(
-    entry_date: date,
-    exact_b_value: Optional[float],
-    exact_redist_value: Optional[float],
-    exact_p1_pension_value: Optional[float],
-    exact_p1_lump_value: Optional[float],
-    exact_p1_allowance_value: Optional[float],
-    exact_post2010_lump_allowance_value: Optional[float],
-):
-    missing = []
-
-    if is_missing_amount(exact_b_value):
-        missing.append("개인 평균 기준소득월액(B값)")
-    if is_missing_amount(exact_redist_value):
-        missing.append("소득재분배 반영 기준소득월액")
-    if is_missing_amount(exact_post2010_lump_allowance_value):
-        missing.append("2010.1.1 이후기간 <Ⅱ·Ⅲ기간> - 일시금/퇴직수당 칸 금액")
-
-    if entry_date <= date(2009, 12, 31):
-        if is_missing_amount(exact_p1_pension_value):
-            missing.append("2009.12.31 이전기간 <Ⅰ기간> - 연금 칸 금액")
-        if is_missing_amount(exact_p1_lump_value):
-            missing.append("2009.12.31 이전기간 <Ⅰ기간> - 일시금 칸 금액")
-        if is_missing_amount(exact_p1_allowance_value):
-            missing.append("2009.12.31 이전기간 <Ⅰ기간> - 퇴직수당 칸 금액")
-
-    return missing
-
-
-def render_exact_input_guide(
-    entry_date: date,
-    exact_b_value: Optional[float],
-    exact_redist_value: Optional[float],
-    exact_p1_pension_value: Optional[float],
-    exact_p1_lump_value: Optional[float],
-    exact_p1_allowance_value: Optional[float],
-    exact_post2010_lump_allowance_value: Optional[float],
-):
-    missing = get_missing_exact_fields(
-        entry_date,
-        exact_b_value,
-        exact_redist_value,
-        exact_p1_pension_value,
-        exact_p1_lump_value,
-        exact_p1_allowance_value,
-        exact_post2010_lump_allowance_value,
+def calculate_pension(inputs: UserInputs, values: EstimatedValues) -> PensionResult:
+    """공무원연금, 일시금, 퇴직수당을 교육용으로 단순 추정합니다."""
+    total_service_years, years_until_retirement = estimate_service_years(
+        appointment_year=inputs.appointment_year,
+        appointment_month=inputs.appointment_month,
+        retirement_age=inputs.retirement_age,
+        current_age=inputs.current_age,
     )
 
-    if not missing:
-        return
+    salary_growth = inputs.salary_growth_rate / 100
+    inflation = inputs.inflation_rate / 100
 
-    st.divider()
-    st.subheader("🧭 적용보수 값 입력 가이드")
-    st.info(
-        "`적용보수 값 사용`을 켠 상태입니다. 아래 설명을 보고 숫자를 직접 입력해주세요. "
-        "필요한 값이 모두 입력되면 이 안내는 자동으로 사라집니다."
+    growth_factor = (1 + salary_growth) ** years_until_retirement
+    inflation_factor = (1 + inflation) ** years_until_retirement
+
+    # 퇴직 시점 추정 적용보수
+    future_b_value = values.actual_b_value * growth_factor
+    future_p3_value = values.actual_p3_value * growth_factor
+    future_post2010_lump_allowance_value = values.post2010_lump_allowance_value * growth_factor
+
+    # 연금 월액 단순 추정
+    # 실제 공단 산식은 기간별 평균기준소득월액, 소득재분배, 상한, 지급개시연령, 재직기간 상한 등 다양한 요소가 있습니다.
+    avg_accrual_rate = calculate_average_accrual_rate(inputs.appointment_year, total_service_years)
+    nominal_monthly_pension = future_p3_value * avg_accrual_rate * total_service_years
+
+    # 2009년 이전 연금 칸 금액이 있으면 일부 반영
+    # 2010년 이후 임용자는 대부분 해당 없음입니다.
+    if values.p1_pension_value > 0:
+        nominal_monthly_pension += values.p1_pension_value * growth_factor * 0.02
+
+    real_monthly_pension = nominal_monthly_pension / inflation_factor if inflation_factor > 0 else nominal_monthly_pension
+
+    # 일시금 단순 추정
+    # 2010년 이후 일시금/퇴직수당 칸 금액을 기준으로 재직기간 계수를 곱합니다.
+    nominal_lump_sum = future_post2010_lump_allowance_value * total_service_years * 0.85
+    if values.p1_lump_value > 0:
+        nominal_lump_sum += values.p1_lump_value * growth_factor
+    real_lump_sum = nominal_lump_sum / inflation_factor if inflation_factor > 0 else nominal_lump_sum
+
+    # 퇴직수당 단순 추정
+    # 공단 실제 산식과 완전히 같지는 않지만, 퇴직수당 규모감 파악용으로 보수적으로 추정합니다.
+    allowance_coefficient = 0.10
+    if total_service_years >= 20:
+        allowance_coefficient = 0.13
+    if total_service_years >= 30:
+        allowance_coefficient = 0.16
+
+    nominal_retirement_allowance = future_post2010_lump_allowance_value * total_service_years * allowance_coefficient
+    if values.p1_allowance_value > 0:
+        nominal_retirement_allowance += values.p1_allowance_value * growth_factor
+    real_retirement_allowance = (
+        nominal_retirement_allowance / inflation_factor if inflation_factor > 0 else nominal_retirement_allowance
     )
 
-    guide_df = pd.DataFrame(
-        {
-            "입력칸": [
-                "개인 평균 기준소득월액 (B값)",
-                "소득재분배 반영 기준소득월액",
-                "2009.12.31 이전기간 <Ⅰ기간> - 연금 칸 금액",
-                "2009.12.31 이전기간 <Ⅰ기간> - 일시금 칸 금액",
-                "2009.12.31 이전기간 <Ⅰ기간> - 퇴직수당 칸 금액",
-                "2010.1.1 이후기간 <Ⅱ·Ⅲ기간> - 일시금/퇴직수당 칸 금액",
-            ],
-            "서류에서 찾는 항목": [
-                "적용보수 표의 '개인 평균 기준소득월액'",
-                "적용보수 표의 '2016년 이후 소득재분배 반영 평균 기준소득월액'",
-                "적용보수 표에서 Ⅰ기간 아래 '연금' 칸",
-                "적용보수 표에서 Ⅰ기간 아래 '일시금' 칸",
-                "적용보수 표에서 Ⅰ기간 아래 '퇴직수당' 칸",
-                "적용보수 표에서 Ⅱ·Ⅲ기간 아래 '일시금' 또는 '퇴직수당' 칸",
-            ],
-        }
+    # 연금 월액의 현재가치 25년 수령 가정 + 일시금 + 퇴직수당
+    pension_25y_nominal_value = nominal_monthly_pension * 12 * 25
+    pension_25y_real_value = real_monthly_pension * 12 * 25
+
+    total_nominal_value = pension_25y_nominal_value + nominal_lump_sum + nominal_retirement_allowance
+    total_real_value = pension_25y_real_value + real_lump_sum + real_retirement_allowance
+
+    replacement_monthly_income = real_monthly_pension
+
+    return PensionResult(
+        total_service_years=total_service_years,
+        years_until_retirement=years_until_retirement,
+        nominal_monthly_pension=nominal_monthly_pension,
+        real_monthly_pension=real_monthly_pension,
+        nominal_lump_sum=nominal_lump_sum,
+        real_lump_sum=real_lump_sum,
+        nominal_retirement_allowance=nominal_retirement_allowance,
+        real_retirement_allowance=real_retirement_allowance,
+        total_nominal_value=total_nominal_value,
+        total_real_value=total_real_value,
+        replacement_monthly_income=replacement_monthly_income,
     )
 
-    st.dataframe(guide_df, use_container_width=True, hide_index=True)
-    st.warning(f"아직 입력이 필요한 항목: **{', '.join(missing)}**")
-    st.link_button("공무원연금공단 홈페이지 열기", GEPS_HOME_URL)
 
+# =========================================================
+# 5. 화면 구성
+# =========================================================
 
-# =====================================
-# UI
-# =====================================
-file_mtime = IMPLEMENTATION_TABLE_PATH.stat().st_mtime if IMPLEMENTATION_TABLE_PATH.exists() else 0
-implementation_table = load_implementation_table(str(IMPLEMENTATION_TABLE_PATH), file_mtime)
-
-st.title("🏛️ 공무원연금 시뮬레이터")
-st.markdown(
-    "왼쪽 사이드바에 **현재 일반기여금, 현재 나이, 최초임용일**을 입력하면 "
-    "예상 공무원연금을 계산합니다. "
-    "이번 버전은 전체 이행률표 CSV, 3기간 종전규정 비교상한, 퇴직수당/일시금 적용보수 분리 계산을 반영합니다."
-)
-
-if implementation_table.empty:
-    st.error(
-        "`implementation_factor_table.csv` 파일을 찾지 못했습니다. "
-        "이행률은 기본 100%로 계산됩니다."
+def render_title() -> None:
+    st.title("📊 공무원연금 예상 계산기")
+    st.caption(
+        "현재 일반기여금과 공단 예상퇴직급여 조회서의 적용보수 값을 바탕으로 "
+        "퇴직 후 연금 규모를 대략 가늠해보는 교육용 계산기입니다."
     )
 
-with st.sidebar:
-    st.header("1. 기본 정보 입력")
+    with st.expander("⚠️ 사용 전 꼭 읽어주세요", expanded=False):
+        st.markdown(
+            """
+            - 이 앱은 **공단 공식 계산기가 아닙니다.**
+            - 실제 연금액은 공무원연금공단 산식, 재직기간, 소득재분배, 기준소득월액 상한, 개인별 이력에 따라 달라집니다.
+            - 결과는 **노후 준비 규모를 감 잡기 위한 참고값**으로만 사용해 주세요.
+            - 정확한 값은 공무원연금공단의 예상퇴직급여 조회서를 우선해야 합니다.
+            """
+        )
 
-    retirement_basis = st.radio(
-        "기본 정년 기준 선택",
-        ["일반공무원 기준 (정년 60세)", "교원 기준 (정년 62세)"],
-        index=1,
-        help="공무원연금 산식은 동일합니다. 이 선택은 예상 퇴직일 자동 계산용입니다.",
-    )
 
-    st.caption("공무원연금 산식은 동일하고, 여기서는 정년 기준만 다르게 적용합니다.")
+def render_sidebar() -> UserInputs:
+    st.sidebar.header("1. 기본 정보")
 
-    current_contribution = st.number_input(
-        "현재 매월 납부하는 일반기여금 (원)",
-        min_value=0,
-        value=None,
-        step=1000,
-        placeholder="예: 601000",
-        help="현재 실제로 내고 있는 일반기여금을 입력하세요.",
-    )
-
-    current_age = st.number_input(
-        "현재 나이 (세)",
+    current_age = st.sidebar.number_input(
+        "현재 나이",
         min_value=20,
-        max_value=80,
-        value=None,
+        max_value=65,
+        value=33,
         step=1,
-        placeholder="예: 45",
+        help="현재 만 나이에 가깝게 입력하면 됩니다.",
     )
 
-    entry_date = st.date_input(
-        "최초임용일",
-        value=None,
-        min_value=date(1970, 1, 1),
-        max_value=date(2100, 12, 31),
+    appointment_year = st.sidebar.number_input(
+        "임용연도",
+        min_value=1980,
+        max_value=2050,
+        value=2016,
+        step=1,
     )
 
-    use_custom_retirement_date = st.toggle("예상 퇴직일 직접 입력", value=False)
+    appointment_month = st.sidebar.number_input(
+        "임용월",
+        min_value=1,
+        max_value=12,
+        value=3,
+        step=1,
+    )
 
-    retirement_date = None
+    retirement_age = st.sidebar.number_input(
+        "예상 퇴직 나이",
+        min_value=50,
+        max_value=70,
+        value=62,
+        step=1,
+    )
 
-    if use_custom_retirement_date:
-        default_retirement_date = (
-            get_default_retirement_date(int(current_age), retirement_basis)
-            if current_age is not None
-            else None
-        )
+    current_contribution = st.sidebar.number_input(
+        "현재 일반기여금 월 납부액",
+        min_value=0,
+        value=395_000,
+        step=10_000,
+        help="급여명세서의 공무원연금 일반기여금 월 납부액을 입력합니다.",
+    )
 
-        retirement_date = st.date_input(
-            "예상 퇴직일",
-            value=default_retirement_date,
-            min_value=date(2000, 1, 1),
-            max_value=date(2100, 12, 31),
-        )
-    else:
-        if current_age is not None:
-            retirement_date = get_default_retirement_date(int(current_age), retirement_basis)
-            st.caption(f"자동 계산된 예상 퇴직일: **{retirement_date.strftime('%Y-%m-%d')}**")
-        else:
-            st.caption("현재 나이를 입력하면 예상 퇴직일이 자동 계산됩니다.")
+    st.sidebar.header("2. 적용보수 직접 입력 (선택)")
+    use_exact_data = st.sidebar.toggle(
+        "공단 예상퇴직급여 조회서의 적용보수 값 직접 입력",
+        value=False,
+    )
 
-    st.divider()
-
-    st.header("2. 적용보수 직접 입력 (선택)")
-    use_exact_data = st.toggle("✅ 적용보수 값 사용", value=False)
-
-    exact_b_value = None
-    exact_redist_value = None
-    exact_p1_pension_value = None
-    exact_p1_lump_value = None
-    exact_p1_allowance_value = None
-    exact_post2010_lump_allowance_value = None
+    exact_b_value: Optional[int] = None
+    exact_redist_value: Optional[int] = None
+    exact_post2010_lump_allowance_value: Optional[int] = None
+    exact_p1_lump_value: Optional[int] = None
+    exact_p1_allowance_value: Optional[int] = None
+    exact_p1_pension_value: Optional[int] = None
 
     if use_exact_data:
-        st.caption("공단 예상퇴직급여 내역의 적용보수 표를 보고 숫자를 직접 입력합니다.")
+        st.sidebar.caption("보고서에 있는 순서와 최대한 비슷하게 입력 흐름을 맞췄습니다.")
 
-        exact_b_value = st.number_input(
+        exact_b_value = st.sidebar.number_input(
             "개인 평균 기준소득월액 (B값)",
             min_value=0,
             value=None,
-            step=10000,
-            placeholder="예: 4518107",
+            step=10_000,
+            placeholder="예: 4,518,107",
+            help="퇴직연금액 예상보고서에서 비교적 쉽게 찾을 수 있는 개인 평균 기준소득월액입니다.",
         )
 
-        exact_redist_value = st.number_input(
-            "소득재분배 반영 기준소득월액",
+        exact_redist_value = st.sidebar.number_input(
+            "2016년 이후 소득재분배 반영 기준소득월액",
             min_value=0,
             value=None,
-            step=10000,
-            placeholder="예: 5486337",
+            step=10_000,
+            placeholder="예: 5,486,337",
+            help="2016년 이후 기간의 연금 산정에 쓰이는 소득재분배 반영 기준소득월액입니다.",
         )
 
-        exact_post2010_lump_allowance_value = st.number_input(
+        exact_post2010_lump_allowance_value = st.sidebar.number_input(
             "2010.1.1 이후기간 <Ⅱ·Ⅲ기간> - 일시금/퇴직수당 칸 금액",
             min_value=0,
             value=None,
-            step=10000,
-            placeholder="예: 5578769",
-            help="적용보수 표에서 2010.1.1 이후기간 <Ⅱ·Ⅲ기간> 아래 '일시금' 또는 '퇴직수당' 칸 금액을 입력합니다.",
+            step=10_000,
+            placeholder="예: 5,578,769",
+            help="적용보수 표에서 2010.1.1 이후기간 <Ⅱ·Ⅲ기간> 아래 일시금 또는 퇴직수당 칸 금액입니다.",
         )
 
-        exact_p1_pension_value = st.number_input(
-            "2009.12.31 이전기간 <Ⅰ기간> - 연금 칸 금액",
-            min_value=0,
-            value=None,
-            step=10000,
-            placeholder="해당 없으면 비워두기",
-            help="적용보수 표에서 2009.12.31 이전기간 <Ⅰ기간> 아래 '연금' 칸 금액입니다. 해당 기간이 없으면 비워둡니다.",
-        )
+        st.sidebar.markdown("---")
+        st.sidebar.caption("2009.12.31 이전기간 <Ⅰ기간>은 보고서 순서대로 입력합니다.")
 
-        exact_p1_lump_value = st.number_input(
+        # 2009년 이전 입력 순서: 일시금 → 퇴직수당 → 연금
+        exact_p1_lump_value = st.sidebar.number_input(
             "2009.12.31 이전기간 <Ⅰ기간> - 일시금 칸 금액",
             min_value=0,
             value=None,
-            step=10000,
+            step=10_000,
             placeholder="해당 없으면 비워두기",
-            help="퇴직연금일시금 계산용입니다. 해당 기간이 없으면 비워둡니다.",
         )
 
-        exact_p1_allowance_value = st.number_input(
+        exact_p1_allowance_value = st.sidebar.number_input(
             "2009.12.31 이전기간 <Ⅰ기간> - 퇴직수당 칸 금액",
             min_value=0,
             value=None,
-            step=10000,
+            step=10_000,
             placeholder="해당 없으면 비워두기",
-            help="퇴직수당 계산용입니다. 해당 기간이 없으면 비워둡니다.",
         )
 
-    st.divider()
-
-    with st.expander("경제 지표 / 고급 설정"):
-        salary_growth_pct = st.number_input(
-            "미래 연 보수상승률 (%)",
-            value=DEFAULT_SALARY_GROWTH * 100,
-            step=0.1,
-        )
-
-        inflation_pct = st.number_input(
-            "미래 연 물가상승률 (%)",
-            value=DEFAULT_INFLATION * 100,
-            step=0.1,
-        )
-
-        period2_rate_pct = st.number_input(
-            "2기간 지급률 / 종전규정 비교 지급률 (%)",
-            value=DEFAULT_PERIOD2_RATE * 100,
-            step=0.001,
-        )
-
-        st.divider()
-
-        retirement_allowance_deduction_months = st.number_input(
-            "퇴직수당 재직기간 감축개월",
+        exact_p1_pension_value = st.sidebar.number_input(
+            "2009.12.31 이전기간 <Ⅰ기간> - 연금 칸 금액",
             min_value=0,
-            value=0,
-            step=1,
-            help=(
-                "공단 예상퇴직급여 화면에서 퇴직급여 재직기간과 퇴직수당 재직기간이 다르면 "
-                "그 차이를 개월 수로 입력하세요. 예: 퇴직급여 10년3월, 퇴직수당 10년1월 → 2개월"
-            ),
+            value=None,
+            step=10_000,
+            placeholder="해당 없으면 비워두기",
         )
 
-        st.caption(
-            "군복무휴직, 육아휴직처럼 일반적으로 퇴직수당에서 감축하지 않는 기간은 입력하지 않습니다. "
-            "공단 화면의 두 재직기간 차이를 입력하는 방식이 가장 안전합니다."
+    st.sidebar.header("3. 가정값")
+
+    salary_growth_rate = st.sidebar.number_input(
+        "연 보수상승률 (%)",
+        min_value=0.0,
+        max_value=10.0,
+        value=2.5,
+        step=0.1,
+    )
+
+    inflation_rate = st.sidebar.number_input(
+        "연 물가상승률 (%)",
+        min_value=0.0,
+        max_value=10.0,
+        value=2.5,
+        step=0.1,
+    )
+
+    current_a_value = st.sidebar.number_input(
+        "전체 공무원 평균 기준소득월액 (A값, 추정용)",
+        min_value=0,
+        value=5_440_000,
+        step=10_000,
+        help="정확히 모르면 기본값을 그대로 두어도 됩니다. 소득재분배 반영 기준소득월액 추정에 사용됩니다.",
+    )
+
+    return UserInputs(
+        current_age=int(current_age),
+        appointment_year=int(appointment_year),
+        appointment_month=int(appointment_month),
+        retirement_age=int(retirement_age),
+        current_contribution=int(current_contribution),
+        salary_growth_rate=float(salary_growth_rate),
+        inflation_rate=float(inflation_rate),
+        current_a_value=int(current_a_value),
+        use_exact_data=bool(use_exact_data),
+        exact_b_value=exact_b_value,
+        exact_redist_value=exact_redist_value,
+        exact_post2010_lump_allowance_value=exact_post2010_lump_allowance_value,
+        exact_p1_lump_value=exact_p1_lump_value,
+        exact_p1_allowance_value=exact_p1_allowance_value,
+        exact_p1_pension_value=exact_p1_pension_value,
+    )
+
+
+def render_estimation_panel(values: EstimatedValues, inputs: UserInputs) -> None:
+    st.subheader("① 현재 기여금 기반 적용보수 추정")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("현재 기준소득월액 역산", manwon(values.current_standard_income))
+    col2.metric("개인 평균 기준소득월액 B값 추정", manwon(values.inferred_b_value))
+    col3.metric("2016년 이후 소득재분배 반영값 추정", manwon(values.inferred_redist_value))
+    col4.metric("2010년 이후 일시금/퇴직수당 추정", manwon(values.inferred_post2010_lump_allowance))
+
+    with st.expander("추정 방식 보기", expanded=False):
+        st.markdown(
+            f"""
+            현재 일반기여금으로 역산한 기준소득월액은 다음 방식으로 계산합니다.
+
+            ```text
+            현재 기준소득월액 = 현재 일반기여금 ÷ 0.09
+            ```
+
+            이후 적용보수 추정은 다음 보정식을 사용합니다.
+
+            ```text
+            개인 평균 기준소득월액 B값 ≈ 현재 기준소득월액 × {EST_B_VALUE_RATIO}
+            2016년 이후 소득재분배 반영 기준소득월액 ≈ (A값 + B값) ÷ 2
+            2010년 이후 일시금/퇴직수당 칸 금액 ≈ 현재 기준소득월액 × {EST_POST2010_LUMP_ALLOWANCE_RATIO}
+            ```
+
+            다만 공단 보고서의 실제 값이 있다면, 직접 입력한 값이 추정값보다 우선 적용됩니다.
+            """
         )
 
-        st.divider()
+    st.subheader("② 실제 계산에 적용된 값")
+    col5, col6, col7 = st.columns(3)
+    col5.metric("적용 B값", manwon(values.actual_b_value))
+    col6.metric("적용 2016년 이후 소득재분배값", manwon(values.actual_p3_value))
+    col7.metric("적용 2010년 이후 일시금/퇴직수당값", manwon(values.post2010_lump_allowance_value))
 
-        use_manual_implementation_factor = st.toggle(
-            "재직기간별 적용비율(이행률) 직접 입력",
-            value=False,
-            help="기본값은 CSV 표 자동 조회입니다. 공단값과 맞춰보고 싶을 때만 직접 입력하세요.",
-        )
-
-        manual_implementation_factor_pct = None
-
-        if use_manual_implementation_factor:
-            manual_implementation_factor_pct = st.number_input(
-                "재직기간별 적용비율(이행률, %)",
-                min_value=60.0,
-                max_value=120.0,
-                value=100.0,
-                step=0.01,
-                help="예: 83.70을 입력하면 0.8370배로 계산합니다.",
-            )
-
-
-# =====================================
-# 필수 입력 검증
-# =====================================
-missing_required = []
-
-if current_contribution is None:
-    missing_required.append("현재 매월 납부하는 일반기여금")
-
-if current_age is None:
-    missing_required.append("현재 나이")
-
-if entry_date is None:
-    missing_required.append("최초임용일")
-
-if retirement_date is None:
-    missing_required.append("예상 퇴직일")
-
-if missing_required:
-    st.info(
-        "👈 왼쪽 사이드바에서 아래 항목을 입력하면 연금 계산이 시작됩니다.\n\n"
-        + "\n".join([f"- {item}" for item in missing_required])
-    )
-    st.stop()
-
-
-if use_exact_data:
-    render_exact_input_guide(
-        entry_date,
-        exact_b_value,
-        exact_redist_value,
-        exact_p1_pension_value,
-        exact_p1_lump_value,
-        exact_p1_allowance_value,
-        exact_post2010_lump_allowance_value,
-    )
-
-
-# =====================================
-# 계산
-# =====================================
-inputs = Inputs(
-    current_age=int(current_age),
-    entry_date=entry_date,
-    retirement_date=retirement_date,
-    current_contribution=int(current_contribution),
-    salary_growth=float(salary_growth_pct) / 100,
-    inflation=float(inflation_pct) / 100,
-    period2_rate=float(period2_rate_pct) / 100,
-    use_exact_data=use_exact_data,
-    exact_b_value=float(exact_b_value or 0),
-    exact_redist_value=float(exact_redist_value or 0),
-    exact_p1_pension_value=float(exact_p1_pension_value or 0),
-    exact_p1_lump_value=float(exact_p1_lump_value or 0),
-    exact_p1_allowance_value=float(exact_p1_allowance_value or 0),
-    exact_post2010_lump_allowance_value=float(exact_post2010_lump_allowance_value or 0),
-    retirement_basis=retirement_basis,
-    manual_implementation_factor_pct=manual_implementation_factor_pct,
-    retirement_allowance_deduction_months=int(retirement_allowance_deduction_months),
-)
-
-res = calculate_pension(inputs, implementation_table)
-
-
-# =====================================
-# 결과 출력
-# =====================================
-st.divider()
-st.subheader("💰 퇴직 시 예상 월 연금액")
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric(
-    "월 연금 (물가할인 현재가치)",
-    won(res.monthly_pension_real),
-    help="미래 퇴직 시점 명목 연금액을 물가상승률로 할인한 현재 체감가치입니다.",
-)
-c2.metric(
-    "월 연금 (퇴직 시 명목가치)",
-    won(res.monthly_pension_nominal),
-    help="퇴직 시점 기준 액면 금액입니다. 보수상승률이 반영됩니다.",
-)
-c3.metric(
-    "총 인정 재직기간",
-    f"{res.recognized_service_years:.2f}년 (상한 {res.service_cap_years}년)",
-)
-c4.metric(
-    "연금 개시 연령",
-    f"{res.pension_start_age}세 ({res.gap_years:.1f}년 공백)",
-)
-
-st.caption(
-    f"적용 이행률: **{res.implementation_factor_pct:.2f}%** "
-    f"({res.implementation_factor_source}, 조회기준 {res.implementation_factor_lookup_years:.2f}년) / "
-    f"3기간 적용 방식: **{res.period3_applied_rule}**"
-)
-
-st.divider()
-st.subheader("💼 퇴직 시 예상 일시금액 (참고용)")
-
-d1, d2, d3, d4 = st.columns(4)
-d1.metric("퇴직수당 (현재가치)", won(res.retirement_allowance_real))
-d2.metric("퇴직수당 (명목가치)", won(res.retirement_allowance_nominal))
-d3.metric("연금일시금 (현재가치)", won(res.pension_lump_sum_real))
-d4.metric("연금일시금 (명목가치)", won(res.pension_lump_sum_nominal))
-
-st.info(
-    f"💡 일시금으로 전액 수령 시 총액 [현재가치]: "
-    f"{won(res.retirement_allowance_real + res.pension_lump_sum_real)} / "
-    f"[명목가치]: {won(res.retirement_allowance_nominal + res.pension_lump_sum_nominal)}"
-)
-
-st.divider()
-left, right = st.columns([1, 1])
-
-with left:
-    st.subheader("📊 적용된 기준 소득")
-    income_df = pd.DataFrame(
-        {
-            "적용 구간": [
-                "1기간 연금용",
-                "2기간 연금용",
-                "3기간 연금용",
-            ],
-            "기준 소득": [
-                won(res.base_p1_income),
-                won(res.base_p2_income),
-                won(res.base_p3_income),
-            ],
-        }
-    )
-    st.dataframe(income_df, use_container_width=True, hide_index=True)
-
-    st.subheader("📘 핵심 계산 근거")
-    basis_df = pd.DataFrame(
-        {
-            "항목": [
-                "현재 일반기여금",
-                "현재 기준소득월액(역산)",
-                "전체 공무원 A값",
-                "추정 B값(적용보수 미입력 시)",
-                "추정 소득재분배 반영값(적용보수 미입력 시)",
-                "실제 날짜 기준 총 재직기간",
-                "2016.1.1 기준 재직기간",
-                "2010년 이전 인정 재직기간",
-                "2010년 이후 인정 재직기간",
-                "재직기간 상한",
-                "적용 이행률",
-                "이행률 조회 기준연수",
-                "이행률 적용 방식",
-                "3기간 적용 방식",
-                "퇴직수당 감축개월",
-                "퇴직수당 인정 재직기간",
-                "퇴직수당 지급비율",
-                "예상 퇴직연도",
-                "퇴직 시점 나이(추정)",
-                "2016년 이후 지급률 가중평균",
-            ],
-            "값": [
-                won(inputs.current_contribution),
-                won(res.current_standard_income),
-                won(res.current_a_value),
-                won(res.inferred_b_value),
-                won(res.inferred_redist_value),
-                f"{res.actual_total_service_years:.2f}년",
-                f"{res.pre_2016_service_years:.2f}년",
-                f"{res.before_2010_service_years:.2f}년",
-                f"{res.after_2010_service_years:.2f}년",
-                f"{res.service_cap_years}년",
-                f"{res.implementation_factor_pct:.2f}%",
-                f"{res.implementation_factor_lookup_years:.2f}년",
-                res.implementation_factor_source,
-                res.period3_applied_rule,
-                f"{res.retirement_allowance_deduction_months}개월",
-                f"{res.retirement_allowance_service_years:.2f}년",
-                f"{res.retirement_allowance_rate_pct:.2f}%",
-                f"{res.retirement_year}년",
-                f"{res.retirement_age_est:.1f}세",
-                pct(res.avg_rate_2016plus),
-            ],
-        }
-    )
-    st.dataframe(basis_df, use_container_width=True, hide_index=True)
-
-with right:
-    st.subheader("📈 기간별 연금 산출 내역")
-    period_df = pd.DataFrame(
-        {
-            "구간": ["1기간", "2기간", "3기간"],
-            "원시 연수": [
-                round(res.raw_y1, 2),
-                round(res.raw_y2, 2),
-                round(res.raw_y3, 2),
-            ],
-            "상한 반영 연수": [
-                round(res.y1, 2),
-                round(res.y2, 2),
-                round(res.y3, 2),
-            ],
-            "연금 기여분": [
-                won(res.period1_monthly),
-                won(res.period2_monthly),
-                won(res.period3_monthly),
-            ],
-        }
-    )
-    st.dataframe(period_df, use_container_width=True, hide_index=True)
-
-    detail_df = pd.DataFrame(
-        {
-            "3기간 세부": [
-                "개정산식: 소득재분배 1% 부분",
-                "개정산식: 개인소득분",
-                "개정산식: 30년 초과분",
-                "개정산식 합계",
-                "종전규정 비교액",
-                "최종 적용액",
-                "적용 방식",
-            ],
-            "값": [
-                won(res.period3_redistribution_monthly),
-                won(res.period3_personal_monthly),
-                won(res.period3_over30_monthly),
-                won(res.period3_new_formula_monthly),
-                won(res.period3_old_rule_cap_monthly),
-                won(res.period3_monthly),
-                res.period3_applied_rule,
-            ],
-        }
-    )
-    st.markdown("##### 3기간 세부 산출")
-    st.dataframe(detail_df, use_container_width=True, hide_index=True)
-
-    lump_detail_df = pd.DataFrame(
-        {
-            "일시금/퇴직수당 세부": [
-                "1기간 퇴직수당",
-                "2010년 이후 퇴직수당",
-                "퇴직수당 합계",
-                "1기간 연금일시금",
-                "2010년 이후 연금일시금",
-                "연금일시금 합계",
-            ],
-            "금액": [
-                won(res.p1_retirement_allowance_real),
-                won(res.post2010_retirement_allowance_real),
-                won(res.retirement_allowance_real),
-                won(res.p1_lump_sum_real),
-                won(res.post2010_lump_sum_real),
-                won(res.pension_lump_sum_real),
-            ],
-        }
-    )
-    st.markdown("##### 일시금/퇴직수당 세부 산출")
-    st.dataframe(lump_detail_df, use_container_width=True, hide_index=True)
-
-    chart_df = pd.DataFrame(
-        {
-            "구간": ["1기간", "2기간", "3기간"],
-            "연금 기여분": [
-                res.period1_monthly,
-                res.period2_monthly,
-                res.period3_monthly,
-            ],
-        }
-    ).set_index("구간")
-    st.bar_chart(chart_df)
-
-
-if use_exact_data:
-    missing_exact = get_missing_exact_fields(
-        entry_date,
-        exact_b_value,
-        exact_redist_value,
-        exact_p1_pension_value,
-        exact_p1_lump_value,
-        exact_p1_allowance_value,
-        exact_post2010_lump_allowance_value,
-    )
-
-    if missing_exact:
-        st.warning(
-            f"⚠️ 적용보수 직접입력 모드입니다. "
-            f"아직 입력이 필요한 항목: {', '.join(missing_exact)}"
-        )
+    if inputs.use_exact_data:
+        st.info("직접 입력한 값이 있는 항목은 직접 입력값을 우선 사용했습니다. 비워둔 항목은 현재 일반기여금 기반 추정값을 사용했습니다.")
     else:
-        st.success("✅ 적용보수 입력이 완료되어 가이드가 자동으로 숨겨졌습니다.")
-else:
-    st.info(
-        "ℹ️ 현재 기여금 기반 추정 모드입니다. "
-        "더 정확히 계산하려면 '적용보수 값 사용'을 켜고 직접 입력하세요."
+        st.warning("공단 보고서 값을 직접 입력하지 않았기 때문에 현재 일반기여금 기반 추정값으로 계산합니다.")
+
+
+def render_result_panel(result: PensionResult) -> None:
+    st.subheader("③ 예상 결과")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("예상 총 재직기간", f"{result.total_service_years:,.1f}년")
+    col2.metric("퇴직까지 남은 기간", f"{result.years_until_retirement}년")
+    col3.metric("월 연금 명목금액", manwon(result.nominal_monthly_pension))
+    col4.metric("월 연금 현재가치", manwon(result.real_monthly_pension))
+
+    st.markdown("---")
+
+    col5, col6, col7 = st.columns(3)
+    col5.metric("일시금 명목 추정", eokwon(result.nominal_lump_sum))
+    col6.metric("퇴직수당 명목 추정", eokwon(result.nominal_retirement_allowance))
+    col7.metric("총 가치 현재가치 추정", eokwon(result.total_real_value))
+
+    st.markdown("---")
+
+    st.subheader("④ 상세표")
+    rows = [
+        ["월 연금", won(result.nominal_monthly_pension), won(result.real_monthly_pension)],
+        ["일시금", won(result.nominal_lump_sum), won(result.real_lump_sum)],
+        ["퇴직수당", won(result.nominal_retirement_allowance), won(result.real_retirement_allowance)],
+        ["연금 25년 수령 가정 + 일시금 + 퇴직수당", won(result.total_nominal_value), won(result.total_real_value)],
+    ]
+    st.dataframe(
+        rows,
+        column_config={
+            0: "구분",
+            1: "퇴직시점 명목금액",
+            2: "현재가치 환산",
+        },
+        hide_index=True,
+        use_container_width=True,
     )
 
 
-st.subheader("연금 계산 공식 설명")
+def render_interpretation(result: PensionResult, inputs: UserInputs) -> None:
+    st.subheader("⑤ 해석")
 
-formula_df = pd.DataFrame(
-    {
-        "구간": ["1기간", "2기간", "3기간", "일시금/퇴직수당", "이행률"],
-        "의미": [
-            "2009.12.31 이전 재직기간",
-            "2010.1.1 ~ 2015.12.31 재직기간",
-            "2016.1.1 이후 재직기간",
-            "퇴직연금일시금 및 퇴직수당",
-            "재직기간별 기준소득월액 적용비율",
-        ],
-        "기본 계산방식": [
-            "Ⅰ기간의 연금 칸 금액을 사용",
-            "B값 × 이행률 × 연수 × 지급률(기본 1.9%)",
-            "개정산식 계산 후 종전규정 비교액과 비교하여 더 낮은 금액 적용",
-            "Ⅰ기간과 2010년 이후기간의 일시금/퇴직수당 적용보수를 분리 계산",
-            "2010년 이후 임용자는 실제 날짜 기준 총 재직연수로 신규자열 조회",
-        ],
-    }
-)
-st.dataframe(formula_df, use_container_width=True, hide_index=True)
+    st.markdown(
+        f"""
+        이 계산에서는 퇴직 후 월 연금을 현재가치 기준으로 약 **{manwon(result.real_monthly_pension)}** 정도로 추정했습니다.
 
-st.markdown(
-    """
-- **1기간**: 2009년 말 이전 재직기간입니다.
-- **2기간**: 2010~2015년 재직기간입니다.
-- **3기간**: 2016년 이후 재직기간입니다.
-- **B값**: 개인 평균 기준소득월액입니다.
-- **소득재분배 반영 기준소득월액**: 2016년 이후 구간 계산에 들어가는 보정된 기준 소득입니다.
-- **Ⅰ기간 연금 칸 금액**: 2009.12.31 이전기간의 월연금 계산에 사용합니다.
-- **Ⅰ기간 일시금/퇴직수당 칸 금액**: 2009.12.31 이전기간의 연금일시금과 퇴직수당 계산에 사용합니다.
-- **Ⅱ·Ⅲ기간 일시금/퇴직수당 칸 금액**: 2010.1.1 이후기간의 연금일시금과 퇴직수당 계산에 사용합니다.
-- **이행률**: 재직기간별 기준소득월액에 적용하는 비율입니다.
-- **이행률 조회 보정**: 2010.1.1 이후 임용자는 월 단위 표시 재직기간이 아니라 실제 날짜 기준 총 재직연수로 신규자열을 조회합니다.
-- **3기간 보정**: 개정산식으로 계산한 금액이 종전규정 비교액보다 크면 종전규정 비교액을 적용합니다.
-- **퇴직수당 감축개월**: 공단 화면에서 퇴직급여 재직기간과 퇴직수당 재직기간이 다를 때 그 차이만큼 입력합니다.
-- 이 버전은 `implementation_factor_table.csv`의 전체 이행률표를 읽어 자동 적용합니다.
-"""
-)
+        여기서 중요한 포인트는 명목금액과 현재가치의 차이입니다.  
+        퇴직 시점에는 월 연금 숫자가 커 보일 수 있지만, 물가상승률을 반영하면 실제 구매력은 줄어들 수 있습니다.
 
-st.subheader("주의")
-st.markdown(
-    """
-- 이 앱은 **공식 산정액이 아닌 추정용 시뮬레이터**입니다.
-- 파일 자동 읽기 기능은 제거하고, **직접 입력 방식으로 단순화**했습니다.
-- 이번 버전은 **전체 이행률표 CSV 자동 조회**, **3기간 종전규정 비교상한**, **퇴직수당 재직기간 감축개월**, **일시금/퇴직수당 적용보수 분리 계산**, **신규자 이행률 조회기준 보정**을 반영했습니다.
-- 처음 접속 시 기본 개인정보 예시는 넣지 않았습니다.
-- `적용보수 값 사용`을 켜면 메인 화면에 입력 가이드가 나타납니다.
-- 실제 지급액은 공무원연금공단의 상세 이력, 경과규정, 실제 기준소득월액 데이터 등에 따라 달라질 수 있습니다.
-"""
-)
+        그래서 공무원연금은 노후의 중요한 1층 안전망이지만, 이것만으로 모든 노후 생활비를 해결한다고 보기보다는
+        연금저축, IRP, ISA, 일반 투자계좌 등과 함께 보는 편이 더 현실적입니다.
+        """
+    )
+
+    if result.real_monthly_pension < 2_000_000:
+        st.warning("현재가치 기준 월 연금 추정치가 200만 원 미만입니다. 개인연금이나 투자자산 보완 필요성이 클 수 있습니다.")
+    elif result.real_monthly_pension < 3_500_000:
+        st.info("현재가치 기준으로 기본 생활비의 한 축은 될 수 있지만, 여유 있는 노후를 위해서는 추가 현금흐름이 필요할 수 있습니다.")
+    else:
+        st.success("현재가치 기준 월 연금 추정치가 비교적 높은 편입니다. 다만 실제 생활비와 배우자/가구 기준 지출을 함께 확인하는 것이 좋습니다.")
+
+
+def render_debug_table(values: EstimatedValues, result: PensionResult) -> None:
+    with st.expander("계산값 점검용 표", expanded=False):
+        debug_rows = [
+            ["현재 기준소득월액 역산", won(values.current_standard_income)],
+            ["B값 추정", won(values.inferred_b_value)],
+            ["2016년 이후 소득재분배값 추정", won(values.inferred_redist_value)],
+            ["2010년 이후 일시금/퇴직수당값 추정", won(values.inferred_post2010_lump_allowance)],
+            ["실제 적용 B값", won(values.actual_b_value)],
+            ["실제 적용 2016년 이후 소득재분배값", won(values.actual_p3_value)],
+            ["실제 적용 2010년 이후 일시금/퇴직수당값", won(values.post2010_lump_allowance_value)],
+            ["총 재직기간", f"{result.total_service_years:,.2f}년"],
+            ["퇴직까지 남은 기간", f"{result.years_until_retirement}년"],
+        ]
+        st.dataframe(debug_rows, column_config={0: "항목", 1: "값"}, hide_index=True, use_container_width=True)
+
+
+# =========================================================
+# 6. 메인 실행
+# =========================================================
+
+def main() -> None:
+    render_title()
+    inputs = render_sidebar()
+
+    values = build_estimated_values(inputs)
+    result = calculate_pension(inputs, values)
+
+    tab1, tab2, tab3 = st.tabs(["계산 결과", "적용보수 확인", "주의사항"])
+
+    with tab1:
+        render_result_panel(result)
+        render_interpretation(result, inputs)
+
+    with tab2:
+        render_estimation_panel(values, inputs)
+        render_debug_table(values, result)
+
+    with tab3:
+        st.markdown(
+            """
+            ## 계산기 사용 시 주의사항
+
+            이 앱은 **정확한 공단 산식 복제용**이 아니라, 선생님들이 노후 준비 규모를 감 잡기 위한 **교육용 추정 계산기**입니다.
+
+            특히 아래 항목은 실제 공단 계산과 차이가 날 수 있습니다.
+
+            - 기간별 기준소득월액 산정 방식
+            - 2010년 이전, 2010년 이후, 2016년 이후 기간별 산식
+            - 소득재분배 반영 방식
+            - 기준소득월액 상한 및 전체 공무원 평균값
+            - 퇴직수당 세부 산식
+            - 연금 지급개시연령 및 실제 수령 시점
+            - 개인별 휴직, 군경력, 추가 산입 기간 등
+
+            따라서 실제 의사결정은 반드시 공무원연금공단의 예상퇴직급여 조회 결과를 기준으로 확인해야 합니다.
+            """
+        )
+
+
+if __name__ == "__main__":
+    main()
